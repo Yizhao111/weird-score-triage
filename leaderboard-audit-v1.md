@@ -84,6 +84,20 @@ curl 'https://hnkceovsiaczvcwhdlkb.supabase.co/rest/v1/rpc/get_leaderboard_task'
 echo "Rows: $(python3 -c "import json; d=json.load(open('/tmp/leaderboard.json')); print(len(d))")"
 ```
 
+### Important: Match the website's displayed trial set
+
+The leaderboard UI is the source of truth for which trials contributed to a visible score. Use the aggregate RPCs for score detection, then use `get_cell_trials` for trajectory inspection. **Do not query the `trial` table directly and treat those rows as evidence**; direct table queries include rows that the website excludes.
+
+Website trial semantics, as documented in `/leaderboard` and implemented by `/trial_view`:
+
+- `get_leaderboard` and `get_leaderboard_task` provide the displayed aggregate cells.
+- `get_cell_trials` returns the exact trial IDs shown when a score cell is clicked.
+- A displayed/valid trial is either a clean run with `reward IS NOT NULL` and `exception_info IS NULL`, or a tolerated terminal exception such as `RewardFileNotFoundError`, `AgentTimeoutError`, or `VerifierTimeoutError`.
+- Excluded infra failures such as `NonZeroAgentExitCodeError`, rate limits, billing errors, and cancellation errors must not be used to explain a displayed score unless they also appear in `get_cell_trials`.
+- Tolerated failures are scored at the benchmark-specific floor used by the leaderboard RPC. Do not hard-code floor semantics unless the UI or RPC output confirms them for the current benchmark.
+- In the default `= 3 trials` mode, the visible score is the average over the latest 3 displayed trials for the cell; `/trial_view` may show up to 5.
+
+
 ---
 
 ## Step 2 — Run the analysis
@@ -457,16 +471,16 @@ for bench in flagged_benches:
     try:
         hist = json.load(open(hist_path))
     except Exception as e:
-        print(f"\n  {bench}: failed to parse {candidates[0]} — {e}")
+        print(f"\n  {bench}: failed to parse {best_file} — {e}")
         continue
 
     results_over_time = hist.get('results_over_time', {})
     if not results_over_time:
-        print(f"\n  {bench}: no results_over_time key in {candidates[0]}")
+        print(f"\n  {bench}: no results_over_time key in {best_file}")
         continue
 
     print(f"\n{'─'*60}")
-    print(f"  {bench}  (history from {candidates[0]})")
+    print(f"  {bench}  (history from {best_file})")
     print(f"{'─'*60}")
 
     # results_over_time is expected to be keyed by "model/agent" or similar
@@ -499,6 +513,125 @@ PYEOF
 - `REGRESSION` (Δ < −10pp) — live score dropped significantly from historical baseline; likely a harness change or env regression
 - `INFLATION` (Δ > +10pp) — live score jumped; could be task leakage, scoring change, or genuine improvement
 - Small Δ (±5pp) — consistent with historical trend, anomaly from Step 2 is probably benchmark-fit not a bug
+
+
+---
+
+## Step 2c — Inspect displayed trial trajectories for flagged cells
+
+Run this only for cells you are about to diagnose. It downloads the same trials the website shows when a user clicks a task score cell. This is the correct path for root-cause evidence.
+
+Use the exact `(benchmark, task_name, model, agent)` from Step 2. For a benchmark-level anomaly, start with the task rows that actually drive the aggregate: low scores, high variance, or model/agent inversions.
+
+```bash
+BENCHMARK='<benchmark>' \
+TASK_NAME='<task_name>' \
+MODEL='<model>' \
+AGENT='<agent>' \
+python3 - << 'PYEOF'
+import json, os, re, tarfile, urllib.request
+from pathlib import Path
+
+SUPABASE_URL = 'https://hnkceovsiaczvcwhdlkb.supabase.co'
+SUPABASE_KEY = 'sb_publishable_kpc09uUk5qcIzVex3NWGAg_y5W7jr6t'
+
+required = ['BENCHMARK', 'TASK_NAME', 'MODEL', 'AGENT']
+missing = [name for name in required if not os.environ.get(name)]
+if missing:
+    raise SystemExit(f"Missing required env var(s): {', '.join(missing)}")
+
+BENCHMARK = os.environ['BENCHMARK']
+TASK_NAME = os.environ['TASK_NAME']
+MODEL = os.environ['MODEL']
+AGENT = os.environ['AGENT']
+OUT = Path('/tmp/harbor-cell-trials') / BENCHMARK / TASK_NAME / MODEL / AGENT
+OUT.mkdir(parents=True, exist_ok=True)
+
+def rpc(name, body):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f'{SUPABASE_URL}/rest/v1/rpc/{name}',
+        data=data,
+        method='POST',
+        headers={
+            'apikey': SUPABASE_KEY,
+            'Authorization': f'Bearer {SUPABASE_KEY}',
+            'Content-Type': 'application/json',
+            'Referer': 'https://harborsubabase.vercel.app/',
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)
+
+def read_member(tf, suffix):
+    for member in tf.getmembers():
+        if member.name.endswith(suffix):
+            f = tf.extractfile(member)
+            return f.read().decode('utf-8', 'replace') if f else ''
+    return ''
+
+trials = rpc('get_cell_trials', {
+    'p_benchmark': BENCHMARK,
+    'p_task_name': TASK_NAME,
+    'p_model': MODEL,
+    'p_agent': AGENT,
+})
+(OUT / 'displayed_trials.json').write_text(json.dumps(trials, indent=2))
+print(f'Displayed trials: {len(trials)}')
+
+for trial in trials:
+    trial_id = trial['trial_id']
+    tgz_path = OUT / f'{trial_id}.tar.gz'
+    if not tgz_path.exists():
+        urllib.request.urlretrieve(trial['trial_uri'], tgz_path)
+
+    exception_type = (trial.get('exception_info') or {}).get('exception_type') or 'OK'
+    cause = []
+    try:
+        with tarfile.open(tgz_path, 'r:gz') as tf:
+            trajectory = read_member(tf, '/agent/trajectory.json')
+            agent_log = read_member(tf, '/agent/claude-code.txt')
+            verifier = read_member(tf, '/verifier/test-stdout.txt')
+            exception_txt = read_member(tf, '/exception.txt')
+
+            if 'Credit balance is too low' in agent_log or 'Credit balance is too low' in trajectory:
+                cause.append('credit_balance_low')
+            if exception_type == 'AgentTimeoutError' or 'Agent execution timed out' in exception_txt:
+                cause.append('agent_timeout')
+            if 'No such file or directory' in verifier:
+                cause.append('missing_required_output')
+            if 'Evaluation crashed:' in verifier:
+                m = re.search(r'Evaluation crashed: (.*)', verifier)
+                cause.append('verifier_crash:' + (m.group(1)[:120] if m else 'unknown'))
+            if 'Metric Error:' in verifier:
+                m = re.search(r'Metric Error: (.*)', verifier)
+                cause.append('metric_error:' + (m.group(1)[:120] if m else 'unknown'))
+            if trajectory:
+                try:
+                    steps = len(json.loads(trajectory).get('steps', []))
+                except Exception:
+                    steps = 'parse_error'
+            else:
+                steps = 'missing'
+    except Exception as e:
+        cause.append('tar_read_error:' + str(e))
+        steps = 'unknown'
+
+    if not cause:
+        cause.append('valid_run' if exception_type == 'OK' else 'unclassified_failure')
+    print(
+        f"rank={trial['trial_rank']} id={trial_id} reward={trial.get('reward')} "
+        f"exception={exception_type} steps={steps} cause={';'.join(cause)}"
+    )
+PYEOF
+```
+
+Interpretation rules:
+
+- If `get_cell_trials` does not return a trial, do not use it as evidence for the visible score.
+- Tolerated timeout rows can legitimately contribute the benchmark floor to the displayed score. Inspect the trajectory tail before calling them model failures; common patterns include long-running optimization, repeated retries, or failure to write required output before timeout.
+- Billing, rate-limit, cancellation, and nonzero-agent-exit rows found via direct table queries are excluded from the website score unless `get_cell_trials` returns them.
+- If a metric permits negative values, do not treat negativity alone as a grader bug; pair score anomalies with trajectory, verifier, README, or parity evidence.
 
 ---
 
@@ -534,7 +667,7 @@ cat /tmp/harbor/adapters/<benchmark>/README.md
 
 Use the README to validate or invalidate anomaly hypotheses from Step 2. For example:
 - if the README says the scoring formula is `correct − 0.25 × wrong`, negative scores are expected for random guessing — **not a bug**
-- if the README documents a known timeout issue with verbose models, that explains sldbench opus behavior
+- if the README documents a known timeout issue with verbose models or agents, use that to contextualize timeout-heavy cells
 - if the README lists required environment files, cross-check against the near-zero task clusters
 
 ### 3c — Read parity_experiment.json
