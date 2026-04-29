@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leaderboard Audit</title>
+<style>
+:root {
+  --bg: #f4efe5;
+  --paper: #fffaf0;
+  --ink: #17211b;
+  --muted: #657065;
+  --line: #d8cbb8;
+  --red: #9e2f24;
+  --orange: #bd691f;
+  --green: #386b4f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: ui-serif, Georgia, "Times New Roman", serif;
+  background:
+    radial-gradient(circle at top left, #fff7dc 0, #f4efe5 34%, #e6efea 100%);
+}
+
+header {
+  padding: 34px clamp(18px, 4vw, 56px) 22px;
+  border-bottom: 1px solid var(--line);
+}
+
+h1 {
+  margin: 0 0 8px;
+  font-size: clamp(30px, 5vw, 58px);
+  letter-spacing: -0.045em;
+  line-height: 0.95;
+}
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 24px;
+}
+
+.meta {
+  max-width: 900px;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.wrap {
+  padding: 22px clamp(18px, 4vw, 56px) 48px;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.stat {
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 250, 240, 0.78);
+  box-shadow: 0 14px 30px rgba(44, 36, 24, 0.06);
+}
+
+.stat b {
+  display: block;
+  font-size: 28px;
+}
+
+.stat span {
+  color: var(--muted);
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: 2fr repeat(4, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 18px 0;
+}
+
+input,
+select {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fffdf7;
+  color: var(--ink);
+  font: inherit;
+}
+
+section {
+  margin-top: 24px;
+}
+
+.summary {
+  display: grid;
+  gap: 9px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.summary li {
+  padding: 12px 14px;
+  border-left: 5px solid var(--green);
+  border-radius: 12px;
+  background: rgba(255, 250, 240, 0.72);
+}
+
+.cards {
+  display: grid;
+  gap: 14px;
+}
+
+.card {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: rgba(255, 250, 240, 0.88);
+  box-shadow: 0 18px 40px rgba(44, 36, 24, 0.08);
+}
+
+.card-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 16px 18px;
+  cursor: pointer;
+}
+
+.title {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  align-items: center;
+}
+
+.title h3 {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: -0.02em;
+}
+
+.badge {
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.p1 {
+  background: #fee2d6;
+  color: var(--red);
+}
+
+.p2 {
+  background: #fff0bf;
+  color: #775300;
+}
+
+.p3 {
+  background: #e5e7e2;
+  color: #4d514b;
+}
+
+.cause {
+  background: #e8efe7;
+  color: #264f3d;
+}
+
+.verdict {
+  background: #eee7d8;
+  color: #57462a;
+}
+
+.card p {
+  margin: 7px 0;
+}
+
+.card-body {
+  display: none;
+  padding: 0 18px 18px;
+  border-top: 1px solid var(--line);
+}
+
+.card.open .card-body {
+  display: block;
+}
+
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.panel {
+  padding: 13px;
+  border: 1px solid #eadfce;
+  border-radius: 14px;
+  background: #fffdf7;
+}
+
+.panel h4 {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+ul.compact {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.score-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 0;
+  border-bottom: 1px dashed #e1d5c5;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 13px;
+}
+
+.action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.action {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 250, 240, 0.78);
+}
+
+.action h3 {
+  margin: 0 0 8px;
+  font-size: 17px;
+}
+
+.empty {
+  padding: 16px;
+  border: 1px dashed var(--line);
+  border-radius: 14px;
+  background: rgba(255, 250, 240, 0.55);
+  color: var(--muted);
+}
+
+@media (max-width: 900px) {
+  .stats,
+  .controls,
+  .grid2,
+  .action-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .card-head {
+    flex-direction: column;
+  }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Leaderboard Anomaly Report</h1>
+  <div class="meta" id="meta"></div>
+</header>
+
+<div class="wrap">
+  <div class="stats">
+    <div class="stat"><b id="benchmarks-seen">0</b><span>Benchmarks Seen</span></div>
+    <div class="stat"><b id="benchmarks-flagged">0</b><span>Flagged</span></div>
+    <div class="stat"><b id="benchmarks-clean">0</b><span>Clean</span></div>
+    <div class="stat"><b id="rows-analyzed">0</b><span>Rows Analyzed</span></div>
+  </div>
+
+  <section>
+    <h2>Trend Summary</h2>
+    <ul class="summary" id="summary"></ul>
+  </section>
+
+  <section>
+    <h2>Flagged Benchmarks</h2>
+    <div class="controls">
+      <input id="q" placeholder="Search benchmark, anomaly, tags...">
+      <select id="cause"><option value="">All root causes</option></select>
+      <select id="verdict"><option value="">All parity verdicts</option></select>
+      <select id="priority">
+        <option value="">All priorities</option>
+        <option value="1">Priority 1</option>
+        <option value="2">Priority 2</option>
+        <option value="3">Priority 3</option>
+      </select>
+      <select id="sort">
+        <option value="priority">Sort by priority</option>
+        <option value="benchmark">Sort by benchmark</option>
+      </select>
+    </div>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <section>
+    <h2>Action Queue</h2>
+    <div class="action-grid" id="actions"></div>
+  </section>
+
+  <section>
+    <h2>Clean Benchmarks</h2>
+    <p id="clean"></p>
+  </section>
+</div>
+
+<script id="report-data" type="application/json">
+%%REPORT_DATA_JSON%%
+</script>
+
+<script>
+function parseReportData() {
+  const raw = document.getElementById("report-data").textContent.trim();
+  if (!raw || raw === "%%REPORT_DATA_JSON%%") {
+    throw new Error("Missing report data. Replace %%REPORT_DATA_JSON%% with serialized report_data JSON.");
+  }
+  return JSON.parse(raw);
+}
+
+const data = parseReportData();
+const get = (id) => document.getElementById(id);
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  "\"": "&quot;",
+  "'": "&#39;"
+}[char]));
+
+function formatInt(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function optionize(id, values) {
+  values.sort().forEach((value) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    get(id).appendChild(option);
+  });
+}
+
+function list(items) {
+  if (!items || !items.length) return "<p>none</p>";
+  return `<ul class="compact">${items.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>`;
+}
+
+function scoreRows(rows) {
+  if (!rows || !rows.length) return "<p>none</p>";
+  return rows.map((row) => `
+    <div class="score-row">
+      <span>${esc(row.model)} / ${esc(row.agent)}</span>
+      <strong>${Number(row.score || 0).toFixed(3)}</strong>
+    </div>
+  `).join("");
+}
+
+function ownerSummary(owner) {
+  if (!owner || !owner.people) return "not mapped";
+  return owner.adapter_name ? `${owner.people} · ${owner.adapter_name}` : owner.people;
+}
+
+function ownerDetails(owner) {
+  if (!owner || !owner.people) return "<p>not mapped</p>";
+  return `
+    <p><strong>People:</strong> ${esc(owner.people)}</p>
+    <p><strong>Adapter:</strong> ${esc(owner.adapter_name || "unknown")}</p>
+  `;
+}
+
+function renderMeta() {
+  get("meta").textContent = `Generated ${data.meta?.generated_at || data.meta?.date || "unknown"}. ${data.meta?.scope || ""}`;
+  get("benchmarks-seen").textContent = formatInt(data.meta?.benchmarks_seen);
+  get("benchmarks-flagged").textContent = formatInt(data.meta?.benchmarks_flagged || data.findings?.length);
+  get("benchmarks-clean").textContent = formatInt((data.meta?.clean_benchmarks || []).length);
+  get("rows-analyzed").textContent = formatInt(data.meta?.rows_analyzed);
+  get("clean").textContent = (data.meta?.clean_benchmarks || []).join(", ") || "none";
+}
+
+function renderSummary() {
+  const findings = data.summary?.headline_findings || [];
+  const notes = data.summary?.analysis_notes || [];
+  get("summary").innerHTML = [
+    ...findings.map((line) => `<li>${esc(line)}</li>`),
+    ...notes.map((line) => `<li><strong>Note:</strong> ${esc(line)}</li>`)
+  ].join("");
+}
+
+function renderActions() {
+  const queue = data.action_queue || {};
+  get("actions").innerHTML = Object.entries(queue).map(([category, items]) => `
+    <div class="action">
+      <h3>${esc(category)} (${items.length})</h3>
+      ${list(items.slice(0, 10))}
+    </div>
+  `).join("");
+}
+
+function renderCards() {
+  const query = get("q").value.toLowerCase();
+  const cause = get("cause").value;
+  const verdict = get("verdict").value;
+  const priority = get("priority").value;
+  const sort = get("sort").value;
+
+  let findings = data.findings || [];
+  findings = findings.filter((finding) => (
+    (!cause || finding.root_cause === cause) &&
+    (!verdict || finding.parity_verdict === verdict) &&
+    (!priority || String(finding.priority) === priority)
+  ));
+
+  if (query) {
+    findings = findings.filter((finding) => JSON.stringify([
+      finding.benchmark,
+      finding.anomaly,
+      finding.root_cause,
+      finding.parity_verdict,
+      finding.historical_trend,
+      finding.tags,
+      finding.parity,
+      finding.historical
+    ]).toLowerCase().includes(query));
+  }
+
+  findings.sort((a, b) => {
+    if (sort === "benchmark") return a.benchmark.localeCompare(b.benchmark);
+    return (a.priority - b.priority) || a.benchmark.localeCompare(b.benchmark);
+  });
+
+  if (!findings.length) {
+    get("cards").innerHTML = '<div class="empty">No findings match the active filters.</div>';
+    return;
+  }
+
+  get("cards").innerHTML = findings.map((finding) => `
+    <article class="card">
+      <div class="card-head" onclick="this.parentElement.classList.toggle('open')">
+        <div>
+          <div class="title">
+            <h3>${esc(finding.benchmark)}</h3>
+            <span class="badge p${esc(finding.priority)}">P${esc(finding.priority)}</span>
+            <span class="badge cause">${esc(finding.root_cause)}</span>
+            <span class="badge verdict">${esc(finding.parity_verdict)}</span>
+          </div>
+          <p>${esc(finding.anomaly)}</p>
+          <p><strong>Experiment owner:</strong> ${esc(ownerSummary(finding.experiment_owner))}</p>
+        </div>
+        <span>expand</span>
+      </div>
+      <div class="card-body">
+        <div class="grid2">
+          <div class="panel">
+            <h4>Evidence</h4>
+            <p><strong>Parity:</strong> ${esc(finding.parity)}</p>
+            <p><strong>History:</strong> ${esc(finding.historical)}</p>
+            <p><strong>Action:</strong> ${esc(finding.recommended_action)}</p>
+          </div>
+          <div class="panel">
+            <h4>Tags</h4>
+            <p>${esc((finding.tags || []).join(", ")) || "none"}</p>
+            <h4>Zero / Near-zero</h4>
+            <p>Near-zero: ${(finding.near_zero_outliers || []).length} shown; exact-zero tasks: ${(finding.exact_zero_tasks || []).length} shown.</p>
+          </div>
+          <div class="panel"><h4>Experiment Owner</h4>${ownerDetails(finding.experiment_owner)}</div>
+          <div class="panel"><h4>Top Scores</h4>${scoreRows(finding.top_scores)}</div>
+          <div class="panel"><h4>Bottom Scores</h4>${scoreRows(finding.bottom_scores)}</div>
+          <div class="panel">
+            <h4>Anomaly Records</h4>
+            ${list((finding.anomaly_records || []).slice(0, 12).map((record) => `${record.kind}: ${record.text}`))}
+          </div>
+          <div class="panel">
+            <h4>Exact-Zero Tasks</h4>
+            ${list((finding.exact_zero_tasks || []).slice(0, 12))}
+          </div>
+        </div>
+      </div>
+    </article>
+  `).join("");
+}
+
+function init() {
+  optionize("cause", [...new Set((data.findings || []).map((finding) => finding.root_cause).filter(Boolean))]);
+  optionize("verdict", [...new Set((data.findings || []).map((finding) => finding.parity_verdict).filter(Boolean))]);
+  ["q", "cause", "verdict", "priority", "sort"].forEach((id) => {
+    get(id).addEventListener("input", renderCards);
+  });
+  renderMeta();
+  renderSummary();
+  renderActions();
+  renderCards();
+}
+
+init();
+</script>
+</body>
+</html>

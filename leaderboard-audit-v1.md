@@ -143,10 +143,29 @@ MODEL_TIERS = {
     'claude-opus-4-6': 3, 'claude-sonnet-4-6': 2, 'claude-haiku-4-5-20251001': 1,
     'gemini-3.1-pro-preview': 2, 'gemini-3-flash-preview': 1,
 }
+FRONTIER_MODELS = {
+    'openai': 'gpt-5.4',
+    'anthropic': 'claude-opus-4-6',
+    'google': 'gemini-3.1-pro-preview',
+}
 AGENT_TIERS = {
-    'codex': 3, 'claude-code': 3, 'gemini-cli': 2, 'terminus-2': 1, 'qwen-coder': 2,
+    'codex': 3, 'claude-code': 3, 'gemini-cli': 2, 'terminus-2': 1,
 }
 NATIVE_AGENT = {'gpt': 'codex', 'claude': 'claude-code', 'gemini': 'gemini-cli'}
+
+# These benchmarks use non-[0,1] metrics, so absolute normalized thresholds
+# such as near-zero, floor, saturation, and negative-score checks do not apply.
+# Keep this list explicit so new score scales are reviewed deliberately.
+UNBOUNDED_SCORE_BENCHMARKS = {
+    'algotune',  # optimization ratios/objective values can exceed 1 by orders of magnitude
+    'mlgym',    # cumulative rewards can be negative or far above 1
+    'sldbench', # clipped R² ranges below 0 and up to 1
+}
+
+def uses_bounded_0_1_scores(bench, scores):
+    if bench.lower() in UNBOUNDED_SCORE_BENCHMARKS:
+        return False
+    return bool(scores) and all(0.0 <= s <= 1.0 for s in scores)
 
 def model_family(m):
     if m.startswith('gpt'): return 'openai'
@@ -200,20 +219,24 @@ def flag_anomalies(agg, agg_std, task_combos):
         models = sorted(set(m for (m, a) in bench_data))
         agents = sorted(set(a for (m, a) in bench_data))
         all_scores = list(bench_data.values())
+        bounded_0_1 = uses_bounded_0_1_scores(bench, all_scores)
 
-        # 1. Negative scores
-        for (m, a), s in bench_data.items():
-            if s < -0.05:
-                anomalies[bench].append(f"NEGATIVE SCORE  {m}/{a} = {s:.3f}")
+        # 1. Negative scores. Only anomalous for normalized [0,1] metrics.
+        if bounded_0_1:
+            for (m, a), s in bench_data.items():
+                if s < -0.05:
+                    anomalies[bench].append(f"NEGATIVE SCORE  {m}/{a} = {s:.3f}")
 
-        # 2. Near-zero when others on same agent are not — collected separately
-        for agent in agents:
-            agent_scores = {m: bench_data[(m, a)] for (m, a) in bench_data if a == agent}
-            if not agent_scores: continue
-            median = sorted(agent_scores.values())[len(agent_scores)//2]
-            for m, s in agent_scores.items():
-                if s < 0.05 and median > 0.3:
-                    near_zeros[bench].append((m, agent, s, median))
+        # 2. Near-zero when others on same agent are not — collected separately.
+        # This threshold is only meaningful for normalized [0,1] metrics.
+        if bounded_0_1:
+            for agent in agents:
+                agent_scores = {m: bench_data[(m, a)] for (m, a) in bench_data if a == agent}
+                if not agent_scores: continue
+                median = sorted(agent_scores.values())[len(agent_scores)//2]
+                for m, s in agent_scores.items():
+                    if s < 0.05 and median > 0.3:
+                        near_zeros[bench].append((m, agent, s, median))
 
         # 3. Within-family model inversions >5pp
         for agent in agents:
@@ -233,16 +256,17 @@ def flag_anomalies(agg, agg_std, task_combos):
                     anomalies[bench].append(
                         f"AGENT INVERSION {model}/{stronger} = {s1:.3f}  <  {model}/{weaker} = {s2:.3f}")
 
-        # 5. Systematic terminus-2 collapse
-        t2_scores = {m: bench_data.get((m, 'terminus-2')) for m in models}
-        other_scores = {}
-        for m in models:
-            others = [bench_data.get((m, a)) for a in agents if a != 'terminus-2' and bench_data.get((m, a)) is not None]
-            if others: other_scores[m] = max(others)
-        collapsed = [m for m in models if t2_scores.get(m) is not None and other_scores.get(m) is not None
-                     and t2_scores[m] < 0.05 and other_scores[m] > 0.30]
-        if len(collapsed) >= 3:
-            anomalies[bench].append(f"TERMINUS-2 COLLAPSE  {len(collapsed)} models: {collapsed}")
+        # 5. Systematic terminus-2 collapse. Uses normalized near-zero thresholds.
+        if bounded_0_1:
+            t2_scores = {m: bench_data.get((m, 'terminus-2')) for m in models}
+            other_scores = {}
+            for m in models:
+                others = [bench_data.get((m, a)) for a in agents if a != 'terminus-2' and bench_data.get((m, a)) is not None]
+                if others: other_scores[m] = max(others)
+            collapsed = [m for m in models if t2_scores.get(m) is not None and other_scores.get(m) is not None
+                         and t2_scores[m] < 0.05 and other_scores[m] > 0.30]
+            if len(collapsed) >= 3:
+                anomalies[bench].append(f"TERMINUS-2 COLLAPSE  {len(collapsed)} models: {collapsed}")
 
         # 6. High score variance using score_std
         for (m, a), std in bench_std.items():
@@ -261,8 +285,9 @@ def flag_anomalies(agg, agg_std, task_combos):
         if broken:
             zero_tasks[bench].extend(broken)
 
-        # 8. Benchmark saturation / floor / score compression
-        if all_scores:
+        # 8. Benchmark saturation / floor / score compression.
+        # Saturation/floor thresholds assume normalized [0,1] metrics.
+        if bounded_0_1:
             max_s, min_s = max(all_scores), min(all_scores)
             if min_s > 0.95:
                 anomalies[bench].append(
@@ -289,15 +314,24 @@ def flag_anomalies(agg, agg_std, task_combos):
                         f"NATIVE UNDERPERF {model}/{nat} = {nat_score:.3f}  <<  "
                         f"{model}/{agent} = {other:.3f}")
 
-        # 10. Cross-family inversions (weaker-tier model beats gpt-5.4 by >15pp)
-        top_gpt54 = max((bench_data.get(('gpt-5.4', a), -1) for a in agents), default=-1)
-        if top_gpt54 > 0:
-            for (m, a), s in bench_data.items():
-                if m == 'gpt-5.4': continue
-                if MODEL_TIERS.get(m, 99) <= 1 and s > top_gpt54 + 0.15:
+        # 10. Cross-family inversions (lower-tier model beats another family's frontier model by >15pp)
+        frontier_best = {}
+        for family, frontier_model in FRONTIER_MODELS.items():
+            best = max((bench_data.get((frontier_model, a), -1) for a in agents), default=-1)
+            if best > 0:
+                frontier_best[family] = (frontier_model, best)
+        for (m, a), s in bench_data.items():
+            fam = model_family(m)
+            if fam is None or MODEL_TIERS.get(m, 99) > 1:
+                continue
+            for frontier_family, (frontier_model, frontier_score) in frontier_best.items():
+                if frontier_family == fam:
+                    continue
+                if s > frontier_score + 0.15:
                     anomalies[bench].append(
-                        f"CROSS-FAMILY INV {m}/{a} = {s:.3f}  >>  gpt-5.4 best={top_gpt54:.3f} "
-                        f"(+{(s-top_gpt54)*100:.0f}pp)")
+                        f"CROSS-FAMILY INV {m}/{a} = {s:.3f}  >>  "
+                        f"{frontier_model} best={frontier_score:.3f} "
+                        f"(+{(s-frontier_score)*100:.0f}pp)")
 
     return anomalies, near_zeros, zero_tasks, stats, benchmarks
 
@@ -411,13 +445,19 @@ PYEOF
 
 For each flagged benchmark, compare the current aggregated scores against the historical `results_over_time` data from the mix analyzer repo. This catches regressions that only became visible over multiple runs.
 
+Important: `results_over_time` is not guaranteed to have a single schema. In current mix-analyzer files it may be:
+- a dict keyed by `"model/agent"` or similar, where each value is a numeric series or scalar
+- a list of dated snapshots like `{"date": ..., "results": [...]}`, where each snapshot contains per-model score records
+
+Normalize the history first; do not assume `.get("model/agent")` will work on every file.
+
 ```bash
 python3 << 'PYEOF'
 import json, os
 from collections import defaultdict
 
 agg = {eval(k): v for k, v in json.load(open('/tmp/agg.json')).items()}
-flagged_benches = sorted(set(k[0] for k in agg))
+benchmarks = sorted(set(k[0] for k in agg))
 jobs_dir = '/tmp/harbor-mix/benchmark_info_jobs'
 
 if not os.path.isdir(jobs_dir):
@@ -459,7 +499,7 @@ def find_best_match(bench):
         return best_file, best_score
     return None, 0.0
 
-for bench in flagged_benches:
+for bench in benchmarks:
     best_file, confidence = find_best_match(bench)
     if best_file is None:
         print(f"\n  {bench}: no historical file found in benchmark_info_jobs/")
@@ -479,26 +519,100 @@ for bench in flagged_benches:
         print(f"\n  {bench}: no results_over_time key in {best_file}")
         continue
 
+    def score_from_result_entry(result_entry):
+        """Extract a comparable scalar score from one historical result entry."""
+        scores = result_entry.get('scores') or []
+        if not scores:
+            return None
+
+        preferred_metrics = [
+            'accuracy_overall',
+            'accuracy',
+            'score',
+            'resolved_rate',
+            'pass_rate',
+            'success_rate',
+        ]
+        for metric in preferred_metrics:
+            for item in scores:
+                if item.get('metric') == metric and isinstance(item.get('value'), (int, float)):
+                    return item['value']
+
+        numeric_scores = [item.get('value') for item in scores if isinstance(item.get('value'), (int, float))]
+        return numeric_scores[0] if numeric_scores else None
+
+    def normalize_model_name(name):
+        return (name or '').strip().lower()
+
+    def normalize_agent_name(name):
+        return (name or '').strip().lower()
+
+    def collect_history_series(results_over_time):
+        """
+        Return {(model, agent): [historical_score, ...]} across supported schemas.
+        Supports:
+        1. dict keyed by 'model/agent' -> list|scalar
+        2. list of dated snapshots with `results: [...]`
+        """
+        series = defaultdict(list)
+
+        if isinstance(results_over_time, dict):
+            for key, value in results_over_time.items():
+                if '/' not in key:
+                    continue
+                model, agent = key.split('/', 1)
+                if isinstance(value, list):
+                    vals = [x for x in value if isinstance(x, (int, float))]
+                    if vals:
+                        series[(model, agent)].extend(vals)
+                elif isinstance(value, (int, float)):
+                    series[(model, agent)].append(value)
+            return series
+
+        if isinstance(results_over_time, list):
+            dated_rows = sorted(
+                [row for row in results_over_time if isinstance(row, dict)],
+                key=lambda row: row.get('date', '')
+            )
+            for row in dated_rows:
+                for result in row.get('results', []):
+                    model = result.get('model')
+                    agent = (
+                        result.get('agent')
+                        or result.get('system_description')
+                        or result.get('system')
+                    )
+                    score = score_from_result_entry(result)
+                    if not model or not agent or score is None:
+                        continue
+                    series[(model, agent)].append(score)
+            return series
+
+        return series
+
+    hist_series_map = collect_history_series(results_over_time)
+
     print(f"\n{'─'*60}")
     print(f"  {bench}  (history from {best_file})")
     print(f"{'─'*60}")
 
-    # results_over_time is expected to be keyed by "model/agent" or similar
-    # Compare each (model, agent) combo in the live data against historical
+    # Compare each (model, agent) combo in the live data against normalized history
     bench_live = {(m, a): s for (b, m, a), s in agg.items() if b == bench}
+    matched_any = False
     for (model, agent), live_score in sorted(bench_live.items(), key=lambda x: -x[1]):
-        hist_key = f"{model}/{agent}"
-        hist_series = results_over_time.get(hist_key)
-        if hist_series is None:
-            continue  # combo not in history, skip silently
-        # Use the most recent historical value as the reference
-        if isinstance(hist_series, list) and hist_series:
-            hist_latest = hist_series[-1]
-            hist_mean   = sum(hist_series) / len(hist_series)
-        elif isinstance(hist_series, (int, float)):
-            hist_latest = hist_mean = hist_series
-        else:
+        hist_series = None
+        for (hist_model, hist_agent), values in hist_series_map.items():
+            if (
+                normalize_model_name(hist_model) == normalize_model_name(model)
+                and normalize_agent_name(hist_agent) == normalize_agent_name(agent)
+            ):
+                hist_series = values
+                break
+        if not hist_series:
             continue
+        matched_any = True
+        hist_latest = hist_series[-1]
+        hist_mean   = sum(hist_series) / len(hist_series)
         delta = live_score - hist_latest
         flag = ""
         if delta < -0.10:
@@ -506,6 +620,8 @@ for bench in flagged_benches:
         elif delta > 0.10:
             flag = "  ← INFLATION"
         print(f"  {model:38s} {agent:15s}  live={live_score:.3f}  hist={hist_latest:.3f}  Δ={delta:+.3f}{flag}")
+    if not matched_any:
+        print("  No directly comparable model/agent history found after schema normalization.")
 PYEOF
 ```
 
@@ -563,9 +679,11 @@ def rpc(name, body):
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.load(r)
 
-def read_member(tf, suffix):
+def read_member(tf, suffixes):
+    if isinstance(suffixes, str):
+        suffixes = [suffixes]
     for member in tf.getmembers():
-        if member.name.endswith(suffix):
+        if any(member.name.endswith(suffix) for suffix in suffixes):
             f = tf.extractfile(member)
             return f.read().decode('utf-8', 'replace') if f else ''
     return ''
@@ -590,7 +708,11 @@ for trial in trials:
     try:
         with tarfile.open(tgz_path, 'r:gz') as tf:
             trajectory = read_member(tf, '/agent/trajectory.json')
-            agent_log = read_member(tf, '/agent/claude-code.txt')
+            agent_log = read_member(tf, [
+                '/agent/claude-code.txt',
+                '/agent/codex.txt',
+                '/agent/gemini-cli.txt',
+            ])
             verifier = read_member(tf, '/verifier/test-stdout.txt')
             exception_txt = read_member(tf, '/exception.txt')
 
@@ -629,9 +751,15 @@ PYEOF
 Interpretation rules:
 
 - If `get_cell_trials` does not return a trial, do not use it as evidence for the visible score.
+- If the verifier reports a missing required submission artifact such as `/app/answer.txt`, `answer.txt`, or another benchmark-required output file, classify the trial as `missing_submission_artifact` first.
+- If `agent_log` contains a plausible final answer or clear task work product, but the verifier reports the required output file is missing, treat the failure as an `Agent Execution Issue` or `Model-Agent Compatibility Issue`, not a `Model Behavior Issue`.
+- If the displayed trials are dominated by `AgentTimeoutError` or `VerifierTimeoutError`, classify the cell as `timeout_or_budget_issue` first. Do not treat it as a wrong-answer failure unless the completed non-timeout trials also show incorrect outputs.
 - Tolerated timeout rows can legitimately contribute the benchmark floor to the displayed score. Inspect the trajectory tail before calling them model failures; common patterns include long-running optimization, repeated retries, or failure to write required output before timeout.
+- If the logs show `RESOURCE_EXHAUSTED`, quota, billing, or rate-limit messages, record `rate_limit_noise` separately. Treat rate-limit evidence as explanatory only when it appears in the displayed trials for the cell; do not use raw trial-table noise as evidence.
 - Billing, rate-limit, cancellation, and nonzero-agent-exit rows found via direct table queries are excluded from the website score unless `get_cell_trials` returns them.
-- If a metric permits negative values, do not treat negativity alone as a grader bug; pair score anomalies with trajectory, verifier, README, or parity evidence.
+- Only classify a cell as a `Model Behavior Issue` when the run completes normally, the required submission artifact is present or not needed, and the produced content is actually wrong or judged incorrect.
+- If a metric permits negative values, do not treat negative reward alone as a scoring bug. Pair the score with verifier output, agent log, adapter README, and parity evidence before assigning root cause.
+- Keep these buckets separate in notes and final reporting: `missing_submission_artifact`, `timeout_or_budget_issue`, `rate_limit_noise`, `true_wrong_answer`.
 
 ---
 
@@ -678,7 +806,15 @@ Read the parity results file for ground-truth reference scores:
 cat /tmp/harbor/adapters/<benchmark>/parity_experiment.json
 ```
 
-Compare the parity scores against the live leaderboard aggregates for the same `(model, agent)` combinations. Flag any of the following:
+Before comparing parity to live leaderboard results, verify that the parity run is actually comparable. Only treat parity as a direct baseline when it is reasonably aligned on:
+- the same benchmark or benchmark slice
+- the same agent, or a clearly equivalent agent mode
+- the same model, or at least the same model family and intended comparison target
+- the same task variant, dataset split, or evaluation setting when that distinction matters
+
+If parity only covers a different agent, a different model family, a different slice, or a different evaluation mode, use it only as context — not as a direct pass/fail baseline.
+
+Compare the parity scores against the live leaderboard aggregates only for reasonably comparable `(model, agent)` setups. Flag any of the following:
 
 | Situation | What it means |
 |---|---|
@@ -699,6 +835,26 @@ For each flagged benchmark, produce a confirmation block:
 - README insight: <one sentence from README that is relevant>
 - Verdict: CONFIRMED ANOMALY / EXPECTED BEHAVIOR / REGRESSION / UNVERIFIED
 ```
+
+### 3d — Map experiment ownership
+
+Use `/Users/han/Workplace/weird-score-triage/experiment-track.csv` to attach experiment ownership metadata to each flagged benchmark. The CSV is keyed by `Adapter Name`; use the `People` column to show who runs the benchmark experiment.
+
+Normalize names before matching:
+- lowercase
+- remove spaces, hyphens, underscores, and punctuation
+- allow aliases such as `bfcl` ↔ `Berkeley Function Calling Leaderboard (BFCL)`, `swtbench` ↔ `SWT Bench`, `research-code-bench` ↔ `reaserchcodebench`, and `spreadsheetbench-verified` ↔ `SpreadsheetBench`
+
+For each finding, add an `experiment_owner` object:
+
+```json
+{
+  "adapter_name": "<Adapter Name from CSV>",
+  "people": "<People from CSV>"
+}
+```
+
+If no CSV row matches a benchmark, still include `experiment_owner` with empty strings so the HTML can show that ownership is unknown rather than silently omitting the field.
 
 ---
 
@@ -734,9 +890,13 @@ Required shape:
     {
       "benchmark": "<name>",
       "priority": 1,
-      "root_cause": "SCORING_BUG",
+      "root_cause": "Scoring or Verifier Issue",
       "parity_verdict": "CONFIRMED ANOMALY",
       "historical_trend": "REGRESSION",
+      "experiment_owner": {
+        "adapter_name": "<Adapter Name from experiment-track.csv>",
+        "people": "<person or owner from experiment-track.csv>"
+      },
       "anomaly": "<one sentence>",
       "parity": "<one sentence>",
       "historical": "<one sentence>",
@@ -745,12 +905,12 @@ Required shape:
     }
   ],
   "action_queue": {
-    "SCORING_BUG": ["<item>", "<item>"],
-    "TASK_BUG": ["<item>", "<item>"],
-    "AGENT_BUG": ["<item>", "<item>"],
-    "COMPAT_BUG": ["<item>", "<item>"],
-    "MODEL_BUG": ["<item>", "<item>"],
-    "NEEDS_INVESTIGATION": ["<item>", "<item>"]
+    "Scoring or Verifier Issue": ["<item>", "<item>"],
+    "Task Or Environment Issue": ["<item>", "<item>"],
+    "Agent Execution Issue": ["<item>", "<item>"],
+    "Model-Agent Compatibility Issue": ["<item>", "<item>"],
+    "Model Behavior Issue": ["<item>", "<item>"],
+    "Needs More Investigation": ["<item>", "<item>"]
   }
 }
 ```
@@ -761,6 +921,7 @@ Rules for `report_data`:
 - `root_cause` must use exactly one of the allowed categories below.
 - `parity_verdict` must be one of: `CONFIRMED ANOMALY`, `EXPECTED BEHAVIOR`, `REGRESSION`, `UNVERIFIED`, `NEEDS_INVESTIGATION`.
 - `historical_trend` should be a short label such as `REGRESSION`, `INFLATION`, `STABLE`, or `MIXED`.
+- `experiment_owner` should be populated from `experiment-track.csv`; use empty strings when no row matches.
 - `tags` should be short machine-friendly strings, not prose sentences.
 - If parity or history is missing or ambiguous, say so explicitly in the relevant string field rather than omitting it.
 
@@ -770,12 +931,12 @@ For each flagged benchmark in `report_data.findings`:
 
 1. **State the anomaly** in one sentence.
 2. **Hypothesize the root cause** using these categories:
-   - `MODEL_BUG` — the model behaved unexpectedly (e.g. perfectionist loop, wrong MC answers)
-   - `AGENT_BUG` — harness/agent is broken for this benchmark (e.g. terminus-2 env setup missing)
-   - `COMPAT_BUG` — specific model+agent combination fails (e.g. gpt-5-nano API format incompatible with codex)
-   - `SCORING_BUG` — negative or nonsensical scores suggest grader issue
-   - `TASK_BUG` — environment setup issue for specific task IDs
-   - `NEEDS_INVESTIGATION` — insufficient evidence to classify
+   - `Model Behavior Issue` — the model behaved unexpectedly (e.g. perfectionist loop, wrong MC answers)
+   - `Agent Execution Issue` — harness/agent is broken for this benchmark (e.g. terminus-2 env setup missing)
+   - `Model-Agent Compatibility Issue` — specific model+agent combination fails (e.g. gpt-5-nano API format incompatible with codex)
+   - `Scoring or Verifier Issue` — negative or nonsensical scores suggest verifier or scoring logic issues
+   - `Task Or Environment Issue` — environment setup issue for specific task IDs
+   - `Needs More Investigation` — insufficient evidence to classify
 3. **Recommend action**: re-run trajectories, fix env setup, audit scoring script, etc.
 
 Group findings by root cause category at the end for a prioritized action list. Use `report_data.action_queue` to hold those grouped items.
@@ -789,16 +950,30 @@ Build the report in memory from `report_data`, then write files at the end.
 Artifacts:
 - `leaderboard-audit-<timestamp>.json` — the structured `report_data` object
 - `leaderboard-audit-<timestamp>.md` — the human-readable markdown report
-- optional `leaderboard-audit-<timestamp>.html` — HTML artifact when requested
+- `leaderboard-audit-<timestamp>.html` — interactive HTML artifact
 
 The report structure:
 
 ```
-## Leaderboard Anomaly Report — <date>
+## Leaderboard Anomaly Report — <datetime>
+### Trend Summary (use very intuitive language with evidence)
+- <agent-harness trend>; examples include <benchmark A> (`<agent1 score> < <agent2 score>`), <benchmark B> (`...`), and <benchmark C> (`...`).
+- <model-order trend>; examples include <benchmark A> (`<weaker model score> > <stronger model score>`), <benchmark B> (`...`), and <benchmark C> (`...`).
+- <scoring/verifier trend>; examples include <benchmark A> (`<score>`), <benchmark B> (`...`), and <benchmark C> (`...`).
+- <task-level trend>; examples include <benchmark A> (`<N exact-zero tasks>`), <benchmark B> (`...`), and <benchmark C> (`...`).
+- `Root-cause mix`: <CATEGORY1>=<count>, <CATEGORY2>=<count>, <CATEGORY3>=<count>, <CATEGORY4>=<count>, <CATEGORY5>=<count>.
+- `Confidence caveat`: <short note about parity/history limitations>.
+
+Example:
+- `gemini-cli` systematically underperforms `terminus-2` for `gemini-3-flash-preview`; examples include `gpqa-diamond` (`0.704 < 0.896`), `lawbench` (`0.542 < 0.648`), and `widesearch` (`0.536 < 0.641`).
+- `gemini-3-flash-preview` outperforms `gemini-3.1-pro-preview` on some benchmarks; examples include `codepde (0.200 > 0.133)`, `mmmlu (0.151 > 0.069)`, and `swtbench (0.560 > 0.487)`.
+- `xxx` benchmark show lots of rate limit issue for `yyy` model
+
 
 ### Flagged Benchmarks (<N>)
 
 #### <benchmark>
+- **Experiment owner**: <People from experiment-track.csv> — <Adapter Name>
 - **Anomaly**: <one sentence>
 - **Parity verdict**: CONFIRMED ANOMALY / EXPECTED BEHAVIOR / REGRESSION / UNVERIFIED — <delta vs parity_experiment.json>
 - **Historical trend**: REGRESSION / INFLATION / STABLE — <delta vs results_over_time>
@@ -809,17 +984,27 @@ The report structure:
 
 ### Action Priority Queue
 
-**AGENT_BUG / COMPAT_BUG** (harness fixes, highest leverage):
+**Agent Execution Issue / Model-Agent Compatibility Issue** (harness fixes, highest leverage):
 - ...
 
-**MODEL_BUG** (needs trajectory review):
+**Task Or Environment Issue** (benchmark/task setup fixes):
 - ...
 
-**SCORING_BUG** (needs grader audit):
+**Model Behavior Issue** (needs trajectory review):
 - ...
 
-**NEEDS_INVESTIGATION**:
+**Scoring or Verifier Issue** (needs verifier or scoring audit):
 - ...
+
+**Needs More Investigation**:
+- ...
+
+### Near-Zero Outliers
+- <benchmark>: <model/agent/task examples> — likely agent execution or compatibility issue
+
+### Exact-Zero Task Clusters
+- <benchmark>: <task names / count> — likely task or environment issue
+
 
 ### Clean Benchmarks
 <list>
@@ -855,11 +1040,11 @@ Presentation guidance for `interactive_html`:
 - favor clarity over decoration
 - use the structured fields directly rather than inventing new labels
 - color/severity mapping should be deterministic:
-  - `SCORING_BUG` => highest severity
-  - `TASK_BUG` / `AGENT_BUG` => high severity
-  - `COMPAT_BUG` => medium severity
-  - `MODEL_BUG` => medium severity
-  - `NEEDS_INVESTIGATION` => lower severity
+  - `Scoring or Verifier Issue` => highest severity
+  - `Task Or Environment Issue` / `Agent Execution Issue` => high severity
+  - `Model-Agent Compatibility Issue` => medium severity
+  - `Model Behavior Issue` => medium severity
+  - `Needs More Investigation` => lower severity
   - `EXPECTED BEHAVIOR` => informational
 - avoid building a framework app unless the user explicitly asks for one
 
@@ -872,22 +1057,23 @@ After composing `report_data` and the markdown report in Step 4, write the artif
 Default behavior:
 - always write `.json`
 - always write `.md`
-- only write `.html` if the user explicitly asks for HTML
+- always write `.html`, use an interactive HTML (use `interactive_html`)
 
-HTML behavior:
-- if the user asked generally for HTML, default to `simple_html`
-- if the user asked for an interactive HTML, dashboard, or richer report, use `interactive_html`
-- for `interactive_html`, embed `report_data` directly into the HTML and render client-side
-- do not depend on external CDNs or network resources
+HTML template:
+- Use `templates/leaderboard-audit-interactive.html` as the reference renderer.
+- The template lives at `/Users/han/Workplace/weird-score-triage/templates/leaderboard-audit-interactive.html`.
+- Replace the `%%REPORT_DATA_JSON%%` placeholder with serialized `report_data` JSON. Do not reparse markdown prose to build the HTML.
 
 ```bash
 mkdir -p ~/harbor-audits
 timestamp="$(date +%Y-%m-%d_%H%M)"
 json_path=~/harbor-audits/leaderboard-audit-"$timestamp".json
 md_path=~/harbor-audits/leaderboard-audit-"$timestamp".md
+html_path=~/harbor-audits/leaderboard-audit-"$timestamp".html
+html_template=/Users/han/Workplace/weird-score-triage/templates/leaderboard-audit-interactive.html
 
 # Write `report_data` to "$json_path".
 # Write the final markdown report to "$md_path".
-# If the user explicitly asked for HTML, also write a companion file:
-# html_path=~/harbor-audits/leaderboard-audit-"$timestamp".html
+# Write the interactive HTML report to "$html_path" by loading "$html_template"
+# and replacing %%REPORT_DATA_JSON%% with json.dumps(report_data).
 ```
