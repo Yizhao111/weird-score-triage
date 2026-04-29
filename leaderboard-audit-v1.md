@@ -62,6 +62,18 @@ If either clone fails, report it and note which steps will be skipped — the an
 
 ---
 
+## Automation shortcut
+
+This repository includes `generate_leaderboard_audit.py`, which implements the report-building portions of this workflow. After fetching `/tmp/leaderboard.json` and preparing `/tmp/harbor` plus `/tmp/harbor-mix`, run:
+
+```bash
+python3 generate_leaderboard_audit.py
+```
+
+The script writes the required `.json`, `.md`, and interactive `.html` artifacts under `~/harbor-audits/`.
+
+---
+
 
 ## Step 1 — Fetch leaderboard data
 

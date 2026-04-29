@@ -1,0 +1,879 @@
+#!/usr/bin/env python3
+import csv
+import json
+import os
+import re
+from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+LEADERBOARD_JSON = Path("/tmp/leaderboard.json")
+HARBOR_ADAPTERS = Path("/tmp/harbor/adapters")
+MIX_JOBS = Path("/tmp/harbor-mix/benchmark_info_jobs")
+TEMPLATE = ROOT / "templates" / "leaderboard-audit-interactive.html"
+OWNERS = ROOT / "experiment-track.csv"
+OUT_DIR = Path.home() / "harbor-audits"
+
+MODEL_TIERS = {
+    "gpt-5.4": 3,
+    "gpt-5-mini": 2,
+    "gpt-5-nano": 1,
+    "claude-opus-4-6": 3,
+    "claude-sonnet-4-6": 2,
+    "claude-haiku-4-5-20251001": 1,
+    "gemini-3.1-pro-preview": 2,
+    "gemini-3-flash-preview": 1,
+}
+FRONTIER_MODELS = {
+    "openai": "gpt-5.4",
+    "anthropic": "claude-opus-4-6",
+    "google": "gemini-3.1-pro-preview",
+}
+AGENT_TIERS = {
+    "codex": 3,
+    "claude-code": 3,
+    "gemini-cli": 2,
+    "terminus-2": 1,
+}
+NATIVE_AGENT = {"gpt": "codex", "claude": "claude-code", "gemini": "gemini-cli"}
+UNBOUNDED_SCORE_BENCHMARKS = {"algotune", "mlgym", "mlgym-bench", "sldbench"}
+ROOT_CAUSES = [
+    "Scoring or Verifier Issue",
+    "Task Or Environment Issue",
+    "Agent Execution Issue",
+    "Model-Agent Compatibility Issue",
+    "Model Behavior Issue",
+    "Needs More Investigation",
+]
+
+
+def norm(value):
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+ALIASES = {
+    "bfcl": "berkeleyfunctioncallingleaderboardbfcl",
+    "berkeleyfunctioncallingleaderboardbfcl": "bfcl",
+    "swtbench": "swtbench",
+    "swt_bench": "swtbench",
+    "researchcodebench": "researchcodebench",
+    "reaserchcodebench": "researchcodebench",
+    "spreadsheetbenchverified": "spreadsheetbench",
+    "spreadsheetbench": "spreadsheetbench",
+    "mlgymbench": "mlgymbench",
+}
+
+
+def canon(value):
+    n = norm(value)
+    return ALIASES.get(n, n)
+
+
+def load_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def model_family(model):
+    if model.startswith("gpt"):
+        return "openai"
+    if model.startswith("claude"):
+        return "anthropic"
+    if model.startswith("gemini"):
+        return "google"
+    return None
+
+
+def native_agent(model):
+    for prefix, agent in NATIVE_AGENT.items():
+        if model.startswith(prefix):
+            return agent
+    return None
+
+
+def stronger_model(a, b):
+    if model_family(a) != model_family(b):
+        return False
+    return MODEL_TIERS.get(a, 0) > MODEL_TIERS.get(b, 0)
+
+
+def stronger_agent(a, b):
+    return AGENT_TIERS.get(a, 0) > AGENT_TIERS.get(b, 0)
+
+
+def stronger_weaker_model_pairs(models):
+    for stronger in models:
+        for weaker in models:
+            if stronger != weaker and stronger_model(stronger, weaker):
+                yield stronger, weaker
+
+
+def stronger_weaker_agent_pairs(agents):
+    for stronger in agents:
+        for weaker in agents:
+            if stronger != weaker and stronger_agent(stronger, weaker):
+                yield stronger, weaker
+
+
+def uses_bounded_scores(benchmark, scores):
+    if norm(benchmark) in {norm(x) for x in UNBOUNDED_SCORE_BENCHMARKS}:
+        return False
+    return bool(scores) and all(0.0 <= s <= 1.0 for s in scores)
+
+
+def aggregate(rows):
+    combo_scores = defaultdict(list)
+    combo_stds = defaultdict(list)
+    task_combos = defaultdict(list)
+    for row in rows:
+        key = (row["benchmark"], row["model"], row["agent"])
+        combo_scores[key].append(float(row["score"]))
+        combo_stds[key].append(float(row.get("score_std") or 0))
+        task_combos[(row["benchmark"], row["task_name"])].append(
+            (row["model"], row["agent"], float(row["score"]))
+        )
+    agg = {key: round(sum(values) / len(values), 4) for key, values in combo_scores.items()}
+    std = {
+        key: round(sum(combo_stds[key]) / len(combo_stds[key]), 4)
+        for key in combo_scores
+    }
+    return agg, std, task_combos
+
+
+def add_record(records, benchmark, kind, text, **extra):
+    record = {"kind": kind, "text": text}
+    record.update(extra)
+    records[benchmark].append(record)
+
+
+def detect_anomalies(agg, agg_std, task_combos):
+    records = defaultdict(list)
+    near_zeros = defaultdict(list)
+    zero_tasks = defaultdict(list)
+    stats = {}
+    benchmarks = sorted({key[0] for key in agg})
+
+    for benchmark in benchmarks:
+        bench_data = {(m, a): s for (b, m, a), s in agg.items() if b == benchmark}
+        bench_std = {(m, a): s for (b, m, a), s in agg_std.items() if b == benchmark}
+        stats[benchmark] = bench_data
+        models = sorted({m for m, _ in bench_data})
+        agents = sorted({a for _, a in bench_data})
+        all_scores = list(bench_data.values())
+        bounded = uses_bounded_scores(benchmark, all_scores)
+
+        if bounded:
+            for (model, agent), score in bench_data.items():
+                if score < -0.05:
+                    add_record(
+                        records,
+                        benchmark,
+                        "negative-score",
+                        f"{model}/{agent} has negative score {score:.3f}.",
+                        model=model,
+                        agent=agent,
+                        score=score,
+                    )
+
+        if bounded:
+            for agent in agents:
+                agent_scores = {
+                    model: bench_data[(model, a)]
+                    for model, a in bench_data
+                    if a == agent
+                }
+                if not agent_scores:
+                    continue
+                median = sorted(agent_scores.values())[len(agent_scores) // 2]
+                for model, score in agent_scores.items():
+                    if score < 0.05 and median > 0.3:
+                        near_zeros[benchmark].append(
+                            {
+                                "model": model,
+                                "agent": agent,
+                                "score": score,
+                                "agent_median": median,
+                            }
+                        )
+
+        for agent in agents:
+            for stronger, weaker in stronger_weaker_model_pairs(models):
+                strong_score = bench_data.get((stronger, agent))
+                weak_score = bench_data.get((weaker, agent))
+                if strong_score is None or weak_score is None:
+                    continue
+                if strong_score < weak_score - 0.05:
+                    add_record(
+                        records,
+                        benchmark,
+                        "model-inversion",
+                        f"{stronger}/{agent} = {strong_score:.3f} < {weaker}/{agent} = {weak_score:.3f}.",
+                        stronger=stronger,
+                        weaker=weaker,
+                        agent=agent,
+                        delta=round(weak_score - strong_score, 4),
+                    )
+
+        for model in models:
+            for stronger, weaker in stronger_weaker_agent_pairs(agents):
+                strong_score = bench_data.get((model, stronger))
+                weak_score = bench_data.get((model, weaker))
+                if strong_score is None or weak_score is None:
+                    continue
+                if strong_score < weak_score - 0.05:
+                    add_record(
+                        records,
+                        benchmark,
+                        "agent-inversion",
+                        f"{model}/{stronger} = {strong_score:.3f} < {model}/{weaker} = {weak_score:.3f}.",
+                        model=model,
+                        stronger=stronger,
+                        weaker=weaker,
+                        delta=round(weak_score - strong_score, 4),
+                    )
+
+        if bounded:
+            collapsed = []
+            for model in models:
+                terminus_score = bench_data.get((model, "terminus-2"))
+                others = [
+                    bench_data.get((model, agent))
+                    for agent in agents
+                    if agent != "terminus-2" and bench_data.get((model, agent)) is not None
+                ]
+                if terminus_score is not None and others and terminus_score < 0.05 and max(others) > 0.30:
+                    collapsed.append(model)
+            if len(collapsed) >= 3:
+                add_record(
+                    records,
+                    benchmark,
+                    "terminus-collapse",
+                    f"terminus-2 is near floor for {len(collapsed)} models while other agents exceed 0.30.",
+                    models=collapsed,
+                )
+
+        for (model, agent), std in bench_std.items():
+            score = bench_data.get((model, agent), 0)
+            if score > 0.1 and std / score > 0.5:
+                add_record(
+                    records,
+                    benchmark,
+                    "high-variance",
+                    f"{model}/{agent} mean={score:.3f}, std={std:.3f}.",
+                    model=model,
+                    agent=agent,
+                    score=score,
+                    std=std,
+                )
+            if std > score > 0.05:
+                add_record(
+                    records,
+                    benchmark,
+                    "std-gt-mean",
+                    f"{model}/{agent} std={std:.3f} exceeds mean={score:.3f}.",
+                    model=model,
+                    agent=agent,
+                    score=score,
+                    std=std,
+                )
+
+        bench_tasks = {task: combos for (b, task), combos in task_combos.items() if b == benchmark}
+        broken = [
+            task
+            for task, combos in bench_tasks.items()
+            if combos and all(score == 0.0 for _, _, score in combos)
+        ]
+        if broken:
+            zero_tasks[benchmark].extend(sorted(broken))
+
+        if bounded and all_scores:
+            min_score, max_score = min(all_scores), max(all_scores)
+            if min_score > 0.95:
+                add_record(records, benchmark, "saturation", f"All combos score above {min_score:.2f}.")
+            if max_score < 0.15:
+                add_record(records, benchmark, "floor", f"All combos score below {max_score:.2f}.")
+            if max_score - min_score < 0.03 and len(all_scores) >= 4:
+                add_record(
+                    records,
+                    benchmark,
+                    "compression",
+                    f"Score range is only {(max_score - min_score) * 100:.1f}pp.",
+                )
+
+        for model in models:
+            agent = native_agent(model)
+            if agent is None:
+                continue
+            native_score = bench_data.get((model, agent))
+            if native_score is None:
+                continue
+            for other_agent in agents:
+                if other_agent == agent:
+                    continue
+                other = bench_data.get((model, other_agent))
+                if other is not None and other > native_score + 0.10:
+                    add_record(
+                        records,
+                        benchmark,
+                        "native-underperformance",
+                        f"{model}/{agent} = {native_score:.3f} trails {model}/{other_agent} = {other:.3f}.",
+                        model=model,
+                        native_agent=agent,
+                        other_agent=other_agent,
+                        delta=round(other - native_score, 4),
+                    )
+
+        frontier_best = {}
+        for family, frontier_model in FRONTIER_MODELS.items():
+            best = max((bench_data.get((frontier_model, agent), -1) for agent in agents), default=-1)
+            if best > 0:
+                frontier_best[family] = (frontier_model, best)
+        for (model, agent), score in bench_data.items():
+            family = model_family(model)
+            if family is None or MODEL_TIERS.get(model, 99) > 1:
+                continue
+            for frontier_family, (frontier_model, frontier_score) in frontier_best.items():
+                if frontier_family == family:
+                    continue
+                if score > frontier_score + 0.15:
+                    add_record(
+                        records,
+                        benchmark,
+                        "cross-family-inversion",
+                        f"{model}/{agent} = {score:.3f} exceeds {frontier_model} best={frontier_score:.3f}.",
+                        model=model,
+                        agent=agent,
+                        frontier_model=frontier_model,
+                        delta=round(score - frontier_score, 4),
+                    )
+
+    return records, near_zeros, zero_tasks, stats, benchmarks
+
+
+def load_owners():
+    owners = []
+    with open(OWNERS, newline="") as f:
+        for row in csv.DictReader(f):
+            owners.append(row)
+    return owners
+
+
+def find_owner(benchmark, owners):
+    target = canon(benchmark)
+    for row in owners:
+        if canon(row.get("Adapter Name")) == target:
+            return {"adapter_name": row.get("Adapter Name", ""), "people": row.get("People", "").strip()}
+    for row in owners:
+        owner_key = canon(row.get("Adapter Name"))
+        if target in owner_key or owner_key in target:
+            return {"adapter_name": row.get("Adapter Name", ""), "people": row.get("People", "").strip()}
+    return {"adapter_name": "", "people": ""}
+
+
+def build_adapter_index():
+    index = {}
+    if not HARBOR_ADAPTERS.is_dir():
+        return index
+    for path in HARBOR_ADAPTERS.iterdir():
+        if path.is_dir():
+            index[canon(path.name)] = path
+    return index
+
+
+def find_adapter(benchmark, adapter_index):
+    target = canon(benchmark)
+    if target in adapter_index:
+        return adapter_index[target]
+    for key, path in adapter_index.items():
+        if target in key or key in target:
+            return path
+    return None
+
+
+def readme_insight(adapter_path):
+    if not adapter_path:
+        return "No matching Harbor adapter folder was found."
+    readme = adapter_path / "README.md"
+    if not readme.exists():
+        return "The adapter has no README.md."
+    text = readme.read_text(errors="replace")
+    candidates = []
+    for line in text.splitlines():
+        clean = re.sub(r"\s+", " ", line.strip(" -#\t"))
+        if len(clean) < 35 or len(clean) > 220:
+            continue
+        low = clean.lower()
+        if any(term in low for term in ["score", "metric", "accuracy", "pass", "reward", "timeout", "negative", "evaluation"]):
+            candidates.append(clean)
+    if candidates:
+        return candidates[0]
+    for line in text.splitlines():
+        clean = re.sub(r"\s+", " ", line.strip(" -#\t"))
+        if 35 <= len(clean) <= 220:
+            return clean
+    return "README.md was present but did not expose a concise scoring note."
+
+
+def parse_score(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        match = re.search(r"-?\d+(?:\.\d+)?", value)
+        if not match:
+            return None
+        number = float(match.group())
+        return number / 100.0 if number > 1.5 else number
+    return None
+
+
+def parity_entries(adapter_path):
+    if not adapter_path:
+        return []
+    path = adapter_path / "parity_experiment.json"
+    if not path.exists():
+        return []
+    try:
+        raw = load_json(path)
+    except Exception:
+        return []
+    records = raw if isinstance(raw, list) else [raw]
+    entries = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        score = None
+        for metric in record.get("metrics") or []:
+            if not isinstance(metric, dict):
+                continue
+            for key in ["harbor", "tb_adapter", "terminal_bench", "adapter", "adapted"]:
+                score = parse_score(metric.get(key))
+                if score is not None:
+                    break
+            if score is not None:
+                break
+        entries.append(
+            {
+                "model": record.get("model", ""),
+                "agent": record.get("agent", ""),
+                "score": score,
+                "date": record.get("date", ""),
+            }
+        )
+    return entries
+
+
+def agent_equivalent(a, b):
+    left, right = norm(a), norm(b)
+    if left == right:
+        return True
+    groups = [
+        {"codex", "codexcli", "codexcloud"},
+        {"claudecode", "claudecodecli"},
+        {"geminicli"},
+        {"terminus2", "terminus1", "terminus"},
+    ]
+    return any(left in group and right in group for group in groups)
+
+
+def parity_summary(benchmark, bench_data, adapter_path):
+    entries = parity_entries(adapter_path)
+    if not adapter_path:
+        return "UNVERIFIED", "No matching adapter folder was found for parity comparison."
+    if not entries:
+        return "UNVERIFIED", "No parity_experiment.json baseline was available for this adapter."
+
+    comparable = []
+    for (model, agent), live_score in bench_data.items():
+        for entry in entries:
+            parity_score = entry.get("score")
+            if parity_score is None:
+                continue
+            same_model = norm(entry.get("model")) == norm(model)
+            same_agent = agent_equivalent(entry.get("agent"), agent)
+            if same_model and same_agent:
+                comparable.append((model, agent, live_score, parity_score, entry.get("date")))
+    if not comparable:
+        refs = ", ".join(
+            f"{e['model']}/{e['agent']}" for e in entries[:3] if e.get("model") or e.get("agent")
+        )
+        return "UNVERIFIED", f"Parity exists but does not directly match live audited model/agent cells. Reference entries: {refs or 'not named'}."
+
+    deltas = [(live - parity, model, agent, live, parity, date) for model, agent, live, parity, date in comparable]
+    worst = min(deltas, key=lambda item: item[0])
+    best = max(deltas, key=lambda item: item[0])
+    if worst[0] < -0.10:
+        verdict = "REGRESSION"
+        chosen = worst
+        direction = "below"
+    elif best[0] > 0.10:
+        verdict = "NEEDS_INVESTIGATION"
+        chosen = best
+        direction = "above"
+    else:
+        verdict = "EXPECTED BEHAVIOR"
+        chosen = max(deltas, key=lambda item: abs(item[0]))
+        direction = "near"
+    delta, model, agent, live, parity, date = chosen
+    return (
+        verdict,
+        f"{model}/{agent} live={live:.3f} is {direction} parity={parity:.3f} by {delta:+.3f}"
+        + (f" from {date}." if date else "."),
+    )
+
+
+def history_file_index():
+    if not MIX_JOBS.is_dir():
+        return {}
+    return {canon(path.stem): path for path in MIX_JOBS.glob("*.json")}
+
+
+def find_history_file(benchmark, index):
+    target = canon(benchmark)
+    if target in index:
+        return index[target]
+    for key, path in index.items():
+        if target in key or key in target:
+            return path
+    return None
+
+
+def score_from_result_entry(result):
+    scores = result.get("scores") or []
+    preferred = ["accuracy_overall", "accuracy", "score", "resolved_rate", "pass_rate", "success_rate"]
+    for metric in preferred:
+        for item in scores:
+            if item.get("metric") == metric and isinstance(item.get("value"), (int, float)):
+                return float(item["value"])
+    numeric = [float(item["value"]) for item in scores if isinstance(item.get("value"), (int, float))]
+    return numeric[0] if numeric else None
+
+
+def collect_history_series(results_over_time):
+    series = defaultdict(list)
+    if isinstance(results_over_time, dict):
+        for key, value in results_over_time.items():
+            if "/" not in key:
+                continue
+            model, agent = key.split("/", 1)
+            if isinstance(value, list):
+                series[(model, agent)].extend(float(x) for x in value if isinstance(x, (int, float)))
+            elif isinstance(value, (int, float)):
+                series[(model, agent)].append(float(value))
+        return series
+    if isinstance(results_over_time, list):
+        for row in sorted([x for x in results_over_time if isinstance(x, dict)], key=lambda x: x.get("date", "")):
+            for result in row.get("results", []):
+                model = result.get("model")
+                agent = result.get("agent") or result.get("system_description") or result.get("system")
+                score = score_from_result_entry(result)
+                if model and agent and score is not None:
+                    series[(model, agent)].append(score)
+    return series
+
+
+def history_summary(benchmark, bench_data, history_index):
+    path = find_history_file(benchmark, history_index)
+    if not path:
+        return "UNVERIFIED", "No mix-analyzer history file matched this benchmark."
+    try:
+        payload = load_json(path)
+    except Exception as exc:
+        return "UNVERIFIED", f"History file {path.name} could not be parsed: {exc}."
+    series = collect_history_series(payload.get("results_over_time"))
+    deltas = []
+    for (model, agent), live_score in bench_data.items():
+        for (hist_model, hist_agent), values in series.items():
+            if norm(hist_model) == norm(model) and norm(hist_agent) == norm(agent) and values:
+                deltas.append((live_score - values[-1], model, agent, live_score, values[-1]))
+                break
+    if not deltas:
+        return "UNVERIFIED", f"History file {path.name} had no directly comparable model/agent rows."
+    regressions = [item for item in deltas if item[0] < -0.10]
+    inflations = [item for item in deltas if item[0] > 0.10]
+    if regressions and inflations:
+        label = "MIXED"
+        chosen = sorted(deltas, key=lambda item: abs(item[0]), reverse=True)[0]
+    elif regressions:
+        label = "REGRESSION"
+        chosen = min(regressions, key=lambda item: item[0])
+    elif inflations:
+        label = "INFLATION"
+        chosen = max(inflations, key=lambda item: item[0])
+    else:
+        label = "STABLE"
+        chosen = sorted(deltas, key=lambda item: abs(item[0]), reverse=True)[0]
+    delta, model, agent, live, hist = chosen
+    return label, f"{model}/{agent} live={live:.3f}, latest history={hist:.3f}, delta={delta:+.3f} from {path.name}."
+
+
+def choose_root_cause(records, near_zero, zero_tasks):
+    kinds = Counter(record["kind"] for record in records)
+    if any(kind in kinds for kind in ["negative-score", "saturation", "floor", "compression"]):
+        return "Scoring or Verifier Issue", 1
+    if zero_tasks:
+        return "Task Or Environment Issue", 1
+    if kinds.get("terminus-collapse") or len(near_zero) >= 3:
+        return "Agent Execution Issue", 1
+    if kinds.get("native-underperformance") or near_zero:
+        return "Model-Agent Compatibility Issue", 2
+    if kinds.get("model-inversion") or kinds.get("cross-family-inversion"):
+        return "Model Behavior Issue", 2
+    return "Needs More Investigation", 3
+
+
+def action_for(root_cause, benchmark):
+    actions = {
+        "Scoring or Verifier Issue": f"{benchmark}: audit score scale, verifier output, and floor semantics before accepting leaderboard aggregates.",
+        "Task Or Environment Issue": f"{benchmark}: inspect exact-zero task environments and rerun after fixing missing files or setup.",
+        "Agent Execution Issue": f"{benchmark}: inspect displayed trials with get_cell_trials and classify timeouts, missing artifacts, and harness failures.",
+        "Model-Agent Compatibility Issue": f"{benchmark}: rerun the affected model/agent cells and check adapter output format compatibility.",
+        "Model Behavior Issue": f"{benchmark}: review trajectories for completed valid runs before treating the inversion as a model quality signal.",
+        "Needs More Investigation": f"{benchmark}: collect displayed trial evidence and parity/history baselines before assigning ownership.",
+    }
+    return actions[root_cause]
+
+
+def summarize_anomaly(records, near_zero, zero_tasks):
+    if zero_tasks:
+        return f"{len(zero_tasks)} task(s) are exact-zero across all displayed model/agent combinations."
+    if near_zero:
+        first = near_zero[0]
+        return (
+            f"{len(near_zero)} near-zero outlier cell(s); "
+            f"{first['model']}/{first['agent']} scored {first['score']:.3f} while the agent median was {first['agent_median']:.3f}."
+        )
+    if records:
+        return records[0]["text"]
+    return "Benchmark was flagged by aggregate checks but needs additional classification."
+
+
+def make_tags(records, near_zero, zero_tasks, history_label, parity_verdict):
+    tags = sorted({record["kind"] for record in records})
+    if near_zero:
+        tags.append("near-zero")
+    if zero_tasks:
+        tags.append("exact-zero-tasks")
+    if history_label:
+        tags.append(history_label.lower().replace("_", "-"))
+    if parity_verdict:
+        tags.append(parity_verdict.lower().replace(" ", "-"))
+    return tags
+
+
+def score_rows(bench_data, reverse=True, limit=5):
+    return [
+        {"model": model, "agent": agent, "score": score}
+        for (model, agent), score in sorted(bench_data.items(), key=lambda item: item[1], reverse=reverse)[:limit]
+    ]
+
+
+def build_findings(records, near_zeros, zero_tasks, stats, benchmarks):
+    owners = load_owners()
+    adapter_index = build_adapter_index()
+    history_index = history_file_index()
+    flagged = [
+        benchmark
+        for benchmark in benchmarks
+        if records.get(benchmark) or near_zeros.get(benchmark) or zero_tasks.get(benchmark)
+    ]
+    findings = []
+    action_queue = {key: [] for key in ROOT_CAUSES}
+
+    for benchmark in flagged:
+        bench_records = records.get(benchmark, [])
+        nz = near_zeros.get(benchmark, [])
+        zt = zero_tasks.get(benchmark, [])
+        bench_data = stats[benchmark]
+        adapter_path = find_adapter(benchmark, adapter_index)
+        root_cause, priority = choose_root_cause(bench_records, nz, zt)
+        parity_verdict, parity_text = parity_summary(benchmark, bench_data, adapter_path)
+        history_label, history_text = history_summary(benchmark, bench_data, history_index)
+        readme_note = readme_insight(adapter_path)
+        recommendation = action_for(root_cause, benchmark)
+        owner = find_owner(benchmark, owners)
+        finding = {
+            "benchmark": benchmark,
+            "priority": priority,
+            "root_cause": root_cause,
+            "parity_verdict": parity_verdict,
+            "historical_trend": history_label,
+            "experiment_owner": owner,
+            "anomaly": summarize_anomaly(bench_records, nz, zt),
+            "parity": f"{parity_text} README note: {readme_note}",
+            "historical": history_text,
+            "recommended_action": recommendation,
+            "tags": make_tags(bench_records, nz, zt, history_label, parity_verdict),
+            "near_zero_outliers": nz[:25],
+            "exact_zero_tasks": zt[:50],
+            "anomaly_records": bench_records[:75],
+            "top_scores": score_rows(bench_data, True, 5),
+            "bottom_scores": score_rows(bench_data, False, 5),
+        }
+        findings.append(finding)
+        action_queue[root_cause].append(recommendation)
+
+    findings.sort(key=lambda item: (item["priority"], item["benchmark"]))
+    return findings, action_queue, flagged
+
+
+def examples(findings, tag, limit=3):
+    out = []
+    for finding in findings:
+        for record in finding.get("anomaly_records", []):
+            if record["kind"] == tag:
+                out.append(f"{finding['benchmark']} ({record['text']})")
+                break
+        if len(out) >= limit:
+            break
+    return out
+
+
+def trend_summary(findings, clean_benchmarks):
+    cause_counts = Counter(finding["root_cause"] for finding in findings)
+    agent_examples = examples(findings, "agent-inversion")
+    model_examples = examples(findings, "model-inversion")
+    scoring_examples = examples(findings, "negative-score") or examples(findings, "floor") or examples(findings, "compression")
+    zero_examples = [
+        f"{finding['benchmark']} ({len(finding.get('exact_zero_tasks', []))} exact-zero tasks)"
+        for finding in findings
+        if finding.get("exact_zero_tasks")
+    ][:3]
+    lines = []
+    lines.append(
+        "Agent-harness anomalies appear in "
+        + (", ".join(agent_examples) if agent_examples else "no strong repeated examples from the aggregate checks")
+        + "."
+    )
+    lines.append(
+        "Model-order inversions appear in "
+        + (", ".join(model_examples) if model_examples else "no strong repeated examples from the aggregate checks")
+        + "."
+    )
+    lines.append(
+        "Scoring/verifier risks appear in "
+        + (", ".join(scoring_examples) if scoring_examples else "no bounded-score negative/floor/compression checks")
+        + "."
+    )
+    lines.append(
+        "Task-level exact-zero clusters appear in "
+        + (", ".join(zero_examples) if zero_examples else "no benchmark-wide exact-zero task clusters")
+        + "."
+    )
+    mix = ", ".join(f"{cause}={cause_counts.get(cause, 0)}" for cause in ROOT_CAUSES)
+    lines.append(f"Root-cause mix: {mix}.")
+    notes = [
+        "Parity and history are treated as direct evidence only when model and agent names matched after normalization.",
+        f"{len(clean_benchmarks)} benchmark(s) were clean under the configured aggregate checks.",
+    ]
+    return lines, notes
+
+
+def build_markdown(report_data):
+    lines = [
+        f"## Leaderboard Anomaly Report - {report_data['meta']['generated_at']}",
+        "",
+        "### Trend Summary",
+    ]
+    for item in report_data["summary"]["headline_findings"]:
+        lines.append(f"- {item}")
+    for item in report_data["summary"]["analysis_notes"]:
+        lines.append(f"- Confidence caveat: {item}")
+    lines.extend(["", f"### Flagged Benchmarks ({len(report_data['findings'])})", ""])
+
+    for finding in report_data["findings"]:
+        owner = finding["experiment_owner"]
+        owner_text = owner.get("people") or "unknown"
+        adapter_text = owner.get("adapter_name") or "not mapped"
+        lines.extend(
+            [
+                f"#### {finding['benchmark']}",
+                f"- **Experiment owner**: {owner_text} - {adapter_text}",
+                f"- **Anomaly**: {finding['anomaly']}",
+                f"- **Parity verdict**: {finding['parity_verdict']} - {finding['parity']}",
+                f"- **Historical trend**: {finding['historical_trend']} - {finding['historical']}",
+                f"- **Root cause hypothesis**: {finding['root_cause']}",
+                f"- **Recommended action**: {finding['recommended_action']}",
+                "",
+            ]
+        )
+
+    lines.append("### Action Priority Queue")
+    for category, items in report_data["action_queue"].items():
+        lines.append("")
+        lines.append(f"**{category}**")
+        if items:
+            for item in items:
+                lines.append(f"- {item}")
+        else:
+            lines.append("- none")
+
+    near_zero_lines = []
+    zero_lines = []
+    for finding in report_data["findings"]:
+        if finding.get("near_zero_outliers"):
+            samples = ", ".join(
+                f"{x['model']}/{x['agent']}={x['score']:.3f}" for x in finding["near_zero_outliers"][:4]
+            )
+            near_zero_lines.append(f"- {finding['benchmark']}: {samples}")
+        if finding.get("exact_zero_tasks"):
+            zero_lines.append(f"- {finding['benchmark']}: {len(finding['exact_zero_tasks'])} task(s)")
+
+    lines.extend(["", "### Near-Zero Outliers"])
+    lines.extend(near_zero_lines or ["none"])
+    lines.extend(["", "### Exact-Zero Task Clusters"])
+    lines.extend(zero_lines or ["none"])
+    lines.extend(["", "### Clean Benchmarks"])
+    lines.append(", ".join(report_data["meta"]["clean_benchmarks"]) or "none")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_outputs(report_data):
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    json_path = OUT_DIR / f"leaderboard-audit-{timestamp}.json"
+    md_path = OUT_DIR / f"leaderboard-audit-{timestamp}.md"
+    html_path = OUT_DIR / f"leaderboard-audit-{timestamp}.html"
+
+    json_path.write_text(json.dumps(report_data, indent=2, sort_keys=True))
+    md_path.write_text(build_markdown(report_data))
+    template = TEMPLATE.read_text()
+    html = template.replace("%%REPORT_DATA_JSON%%", json.dumps(report_data, indent=2), 1)
+    html_path.write_text(html)
+    return json_path, md_path, html_path
+
+
+def main():
+    rows = load_json(LEADERBOARD_JSON)
+    agg, std, task_combos = aggregate(rows)
+    records, near_zeros, zero_tasks, stats, benchmarks = detect_anomalies(agg, std, task_combos)
+    findings, action_queue, flagged = build_findings(records, near_zeros, zero_tasks, stats, benchmarks)
+    clean = sorted(set(benchmarks) - set(flagged))
+    headline, notes = trend_summary(findings, clean)
+
+    report_data = {
+        "meta": {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M %Z").strip(),
+            "scope": "Harbor leaderboard task RPC with p_min_trials=3 and p_window=3, filtered to tracked OpenAI, Anthropic, and Google model families.",
+            "benchmarks_seen": len(benchmarks),
+            "benchmarks_flagged": len(findings),
+            "clean_benchmarks": clean,
+            "rows_analyzed": len(rows),
+        },
+        "summary": {
+            "headline_findings": headline,
+            "analysis_notes": notes,
+        },
+        "findings": findings,
+        "action_queue": action_queue,
+    }
+    paths = write_outputs(report_data)
+    print(json.dumps({key: str(path) for key, path in zip(["json", "markdown", "html"], paths)}, indent=2))
+    print(f"benchmarks_seen={len(benchmarks)} benchmarks_flagged={len(findings)} rows_analyzed={len(rows)}")
+
+
+if __name__ == "__main__":
+    main()
