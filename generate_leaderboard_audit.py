@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 LEADERBOARD_JSON = Path("/tmp/leaderboard.json")
+LEADERBOARD_AGG_JSON = Path("/tmp/leaderboard_aggregate.json")
 HARBOR_ADAPTERS = Path("/tmp/harbor/adapters")
 MIX_JOBS = Path("/tmp/harbor-mix/benchmark_info_jobs")
 TEMPLATE = ROOT / "templates" / "leaderboard-audit-interactive.html"
@@ -39,6 +40,7 @@ AGENT_TIERS = {
 }
 NATIVE_AGENT = {"gpt": "codex", "claude": "claude-code", "gemini": "gemini-cli"}
 UNBOUNDED_SCORE_BENCHMARKS = {"algotune", "mlgym", "mlgym-bench", "sldbench"}
+EXCLUDED_BENCHMARKS = {"deveval", "ds-1000", "featbench", "multi-swe-bench"}
 ROOT_CAUSES = [
     "Scoring or Verifier Issue",
     "Task Or Environment Issue",
@@ -123,23 +125,63 @@ def uses_bounded_scores(benchmark, scores):
     return bool(scores) and all(0.0 <= s <= 1.0 for s in scores)
 
 
+def aggregate_task_rows(rows):
+    task_combos = defaultdict(list)
+    for row in rows:
+        task_combos[(row["benchmark"], row["task_name"])].append(
+            (row["model"], row["agent"], float(row["score"]))
+        )
+    return task_combos
+
+
+def filter_rows(rows):
+    return [row for row in rows if row.get("benchmark") not in EXCLUDED_BENCHMARKS]
+
+
+def task_score_summaries(rows):
+    grouped = defaultdict(list)
+    for row in rows:
+        key = (row["benchmark"], row["model"], row["agent"])
+        grouped[key].append(float(row["score"]))
+    summaries = {}
+    for key, scores in grouped.items():
+        ordered = sorted(scores)
+        count = len(ordered)
+        mid = count // 2
+        median = ordered[mid] if count % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+        summaries[key] = {
+            "task_rows": count,
+            "task_mean": round(sum(ordered) / count, 4),
+            "task_median": round(median, 4),
+            "task_min": round(ordered[0], 4),
+            "task_max": round(ordered[-1], 4),
+        }
+    return summaries
+
+
+def aggregate_benchmark_rows(rows):
+    agg = {}
+    std = {}
+    for row in rows:
+        key = (row["benchmark"], row["model"], row["agent"])
+        agg[key] = round(float(row["score"]), 4)
+        std[key] = round(float(row.get("score_std") or 0), 4)
+    return agg, std
+
+
 def aggregate(rows):
     combo_scores = defaultdict(list)
     combo_stds = defaultdict(list)
-    task_combos = defaultdict(list)
     for row in rows:
         key = (row["benchmark"], row["model"], row["agent"])
         combo_scores[key].append(float(row["score"]))
         combo_stds[key].append(float(row.get("score_std") or 0))
-        task_combos[(row["benchmark"], row["task_name"])].append(
-            (row["model"], row["agent"], float(row["score"]))
-        )
     agg = {key: round(sum(values) / len(values), 4) for key, values in combo_scores.items()}
     std = {
         key: round(sum(combo_stds[key]) / len(combo_stds[key]), 4)
         for key in combo_scores
     }
-    return agg, std, task_combos
+    return agg, std
 
 
 def add_record(records, benchmark, kind, text, **extra):
@@ -464,6 +506,15 @@ def parity_entries(adapter_path):
     return entries
 
 
+def parity_link(adapter_path):
+    if not adapter_path:
+        return ""
+    path = adapter_path / "parity_experiment.json"
+    if not path.exists():
+        return ""
+    return f"https://github.com/harbor-framework/harbor/blob/main/adapters/{adapter_path.name}/parity_experiment.json"
+
+
 def agent_equivalent(a, b):
     left, right = norm(a), norm(b)
     if left == right:
@@ -669,7 +720,63 @@ def score_rows(bench_data, reverse=True, limit=5):
     ]
 
 
-def build_findings(records, near_zeros, zero_tasks, stats, benchmarks):
+def anomaly_score_keys(records):
+    keys = defaultdict(set)
+    for record in records:
+        kind = record.get("kind")
+        if kind == "model-inversion":
+            agent = record.get("agent")
+            for model_key in ["stronger", "weaker"]:
+                model = record.get(model_key)
+                if model and agent:
+                    keys[(model, agent)].add(kind)
+        elif kind == "agent-inversion":
+            model = record.get("model")
+            for agent_key in ["stronger", "weaker"]:
+                agent = record.get(agent_key)
+                if model and agent:
+                    keys[(model, agent)].add(kind)
+        elif kind == "native-underperformance":
+            model = record.get("model")
+            native = record.get("native_agent")
+            other = record.get("other_agent")
+            if model and native:
+                keys[(model, native)].add(kind)
+            if model and other:
+                keys[(model, other)].add(kind)
+        elif record.get("model") and record.get("agent"):
+            keys[(record["model"], record["agent"])].add(kind)
+    return [
+        {"model": model, "agent": agent, "tags": sorted(tags)}
+        for (model, agent), tags in sorted(keys.items())
+    ]
+
+
+def score_diagnostics(benchmark, bench_data, task_summaries, limit=8):
+    rows = []
+    for (model, agent), displayed_score in bench_data.items():
+        summary = task_summaries.get((benchmark, model, agent))
+        if not summary:
+            continue
+        task_mean = summary["task_mean"]
+        delta = round(task_mean - displayed_score, 4)
+        row = {
+            "model": model,
+            "agent": agent,
+            "displayed_score": displayed_score,
+            "task_mean": task_mean,
+            "task_median": summary["task_median"],
+            "task_min": summary["task_min"],
+            "task_max": summary["task_max"],
+            "task_rows": summary["task_rows"],
+            "mean_minus_displayed": delta,
+        }
+        rows.append(row)
+    rows.sort(key=lambda row: abs(row["mean_minus_displayed"]), reverse=True)
+    return rows[:limit]
+
+
+def build_findings(records, near_zeros, zero_tasks, stats, benchmarks, task_summaries):
     owners = load_owners()
     adapter_index = build_adapter_index()
     history_index = history_file_index()
@@ -698,6 +805,7 @@ def build_findings(records, near_zeros, zero_tasks, stats, benchmarks):
             "priority": priority,
             "root_cause": root_cause,
             "parity_verdict": parity_verdict,
+            "parity_link": parity_link(adapter_path),
             "historical_trend": history_label,
             "experiment_owner": owner,
             "anomaly": summarize_anomaly(bench_records, nz, zt),
@@ -708,8 +816,14 @@ def build_findings(records, near_zeros, zero_tasks, stats, benchmarks):
             "near_zero_outliers": nz[:25],
             "exact_zero_tasks": zt[:50],
             "anomaly_records": bench_records[:75],
-            "top_scores": score_rows(bench_data, True, 5),
-            "bottom_scores": score_rows(bench_data, False, 5),
+            "top_scores": score_rows(bench_data, True, 8),
+            "bottom_scores": score_rows(bench_data, False, 8),
+            "score_basis": {
+                "displayed_score": "get_leaderboard benchmark aggregate",
+                "task_distribution": "get_leaderboard_task rows summarized for diagnostics",
+            },
+            "anomaly_score_keys": anomaly_score_keys(bench_records),
+            "task_score_diagnostics": score_diagnostics(benchmark, bench_data, task_summaries),
         }
         findings.append(finding)
         action_queue[root_cause].append(recommendation)
@@ -786,12 +900,26 @@ def build_markdown(report_data):
         owner = finding["experiment_owner"]
         owner_text = owner.get("people") or "unknown"
         adapter_text = owner.get("adapter_name") or "not mapped"
+        diagnostics = finding.get("task_score_diagnostics") or []
+        if diagnostics:
+            top_diag = diagnostics[0]
+            score_note = (
+                f"{top_diag['model']}/{top_diag['agent']} displayed={top_diag['displayed_score']:.3f}, "
+                f"task_mean={top_diag['task_mean']:.3f}, task_median={top_diag['task_median']:.3f}, "
+                f"range={top_diag['task_min']:.3f}-{top_diag['task_max']:.3f}, "
+                f"delta={top_diag['mean_minus_displayed']:+.3f}."
+            )
+        else:
+            score_note = "No task-level score rows were available for diagnostic comparison."
         lines.extend(
             [
                 f"#### {finding['benchmark']}",
                 f"- **Experiment owner**: {owner_text} - {adapter_text}",
                 f"- **Anomaly**: {finding['anomaly']}",
-                f"- **Parity verdict**: {finding['parity_verdict']} - {finding['parity']}",
+                f"- **Score aggregation**: {score_note}",
+                f"- **[Parity]({finding['parity_link']}) verdict**: {finding['parity_verdict']} - {finding['parity']}"
+                if finding.get("parity_link")
+                else f"- **Parity verdict**: {finding['parity_verdict']} - {finding['parity']}",
                 f"- **Historical trend**: {finding['historical_trend']} - {finding['historical']}",
                 f"- **Root cause hypothesis**: {finding['root_cause']}",
                 f"- **Recommended action**: {finding['recommended_action']}",
@@ -846,10 +974,22 @@ def write_outputs(report_data):
 
 
 def main():
-    rows = load_json(LEADERBOARD_JSON)
-    agg, std, task_combos = aggregate(rows)
+    raw_rows = load_json(LEADERBOARD_JSON)
+    rows = filter_rows(raw_rows)
+    score_rows_source = "task RPC averaged by script"
+    if LEADERBOARD_AGG_JSON.exists():
+        aggregate_rows = filter_rows(load_json(LEADERBOARD_AGG_JSON))
+        agg, std = aggregate_benchmark_rows(aggregate_rows)
+        score_rows_source = "benchmark RPC get_leaderboard"
+    else:
+        aggregate_rows = []
+        agg, std = aggregate(rows)
+    task_combos = aggregate_task_rows(rows)
+    task_summaries = task_score_summaries(rows)
     records, near_zeros, zero_tasks, stats, benchmarks = detect_anomalies(agg, std, task_combos)
-    findings, action_queue, flagged = build_findings(records, near_zeros, zero_tasks, stats, benchmarks)
+    findings, action_queue, flagged = build_findings(
+        records, near_zeros, zero_tasks, stats, benchmarks, task_summaries
+    )
     clean = sorted(set(benchmarks) - set(flagged))
     headline, notes = trend_summary(findings, clean)
 
@@ -857,11 +997,15 @@ def main():
         "meta": {
             "date": datetime.now().strftime("%Y-%m-%d"),
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M %Z").strip(),
-            "scope": "Harbor leaderboard task RPC with p_min_trials=3 and p_window=3, filtered to tracked OpenAI, Anthropic, and Google model families.",
+            "scope": "Harbor leaderboard RPCs with p_min_trials=3 and p_window=3, filtered to tracked OpenAI, Anthropic, and Google model families. Benchmark scores come from get_leaderboard when /tmp/leaderboard_aggregate.json is present; task rows come from get_leaderboard_task.",
             "benchmarks_seen": len(benchmarks),
             "benchmarks_flagged": len(findings),
             "clean_benchmarks": clean,
             "rows_analyzed": len(rows),
+            "raw_rows_fetched": len(raw_rows),
+            "aggregate_rows_analyzed": len(aggregate_rows),
+            "excluded_benchmarks": sorted(EXCLUDED_BENCHMARKS),
+            "score_rows_source": score_rows_source,
         },
         "summary": {
             "headline_findings": headline,

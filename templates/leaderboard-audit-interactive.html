@@ -235,6 +235,26 @@ ul.compact {
   font-size: 13px;
 }
 
+.score-row.flagged {
+  margin: 3px -6px;
+  padding: 6px;
+  border: 1px solid #fdb022;
+  border-radius: 6px;
+  background: #fffaeb;
+}
+
+.score-main {
+  min-width: 0;
+}
+
+.score-tags {
+  display: block;
+  margin-top: 2px;
+  color: var(--orange);
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .action-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -366,13 +386,52 @@ function list(items) {
   return `<ul class="compact">${items.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>`;
 }
 
-function scoreRows(rows) {
+function anomalyMap(finding) {
+  const map = new Map();
+  (finding.anomaly_score_keys || []).forEach((item) => {
+    map.set(`${item.model}|||${item.agent}`, item.tags || []);
+  });
+  return map;
+}
+
+function scoreRows(rows, finding) {
+  if (!rows || !rows.length) return "<p>none</p>";
+  const flags = anomalyMap(finding || {});
+  return rows.map((row) => `
+    ${(() => {
+      const tags = flags.get(`${row.model}|||${row.agent}`) || [];
+      const flagged = tags.length > 0;
+      return `<div class="score-row ${flagged ? "flagged" : ""}">
+      <span class="score-main">${esc(row.model)} / ${esc(row.agent)}${flagged ? `<span class="score-tags">${esc(tags.join(", "))}</span>` : ""}</span>
+      <strong>${Number(row.score || 0).toFixed(3)}</strong>
+    </div>`;
+    })()}
+  `).join("");
+}
+
+function taskDiagnostics(rows) {
   if (!rows || !rows.length) return "<p>none</p>";
   return rows.map((row) => `
+    ${(() => {
+      const delta = Number(row.mean_minus_displayed || 0);
+      const differs = Math.abs(delta) >= 0.0005;
+      const displayed = Number(row.displayed_score || 0).toFixed(3);
+      const taskMean = Number(row.task_mean || 0).toFixed(3);
+      const scoreText = differs ? `${displayed} vs ${taskMean}` : displayed;
+      const detailText = differs
+        ? `task mean differs · median ${Number(row.task_median || 0).toFixed(3)} · range ${Number(row.task_min || 0).toFixed(3)}-${Number(row.task_max || 0).toFixed(3)} · n=${esc(row.task_rows)}`
+        : `task mean matches displayed · median ${Number(row.task_median || 0).toFixed(3)} · range ${Number(row.task_min || 0).toFixed(3)}-${Number(row.task_max || 0).toFixed(3)} · n=${esc(row.task_rows)}`;
+      return `
     <div class="score-row">
       <span>${esc(row.model)} / ${esc(row.agent)}</span>
-      <strong>${Number(row.score || 0).toFixed(3)}</strong>
+      <strong>${scoreText}</strong>
     </div>
+    <div class="score-row">
+      <span>${detailText}</span>
+      <strong>${differs ? delta.toFixed(3) : ""}</strong>
+    </div>
+      `;
+    })()}
   `).join("");
 }
 
@@ -387,6 +446,11 @@ function ownerDetails(owner) {
     <p><strong>People:</strong> ${esc(owner.people)}</p>
     <p><strong>Adapter:</strong> ${esc(owner.adapter_name || "unknown")}</p>
   `;
+}
+
+function parityLabel(finding) {
+  if (!finding.parity_link) return "<strong>Parity:</strong>";
+  return `<strong><a href="${esc(finding.parity_link)}" target="_blank" rel="noopener">Parity</a>:</strong>`;
 }
 
 function renderMeta() {
@@ -440,7 +504,8 @@ function renderCards() {
       finding.historical_trend,
       finding.tags,
       finding.parity,
-      finding.historical
+      finding.historical,
+      finding.task_score_diagnostics
     ]).toLowerCase().includes(query));
   }
 
@@ -473,7 +538,7 @@ function renderCards() {
         <div class="grid2">
           <div class="panel">
             <h4>Evidence</h4>
-            <p><strong>Parity:</strong> ${esc(finding.parity)}</p>
+            <p>${parityLabel(finding)} ${esc(finding.parity)}</p>
             <p><strong>History:</strong> ${esc(finding.historical)}</p>
             <p><strong>Action:</strong> ${esc(finding.recommended_action)}</p>
           </div>
@@ -483,9 +548,15 @@ function renderCards() {
             <h4>Zero / Near-zero</h4>
             <p>Near-zero: ${(finding.near_zero_outliers || []).length} shown; exact-zero tasks: ${(finding.exact_zero_tasks || []).length} shown.</p>
           </div>
+          <div class="panel"><h4>Top Scores</h4>${scoreRows(finding.top_scores, finding)}</div>
+          <div class="panel"><h4>Bottom Scores</h4>${scoreRows(finding.bottom_scores, finding)}</div>
           <div class="panel"><h4>Experiment Owner</h4>${ownerDetails(finding.experiment_owner)}</div>
-          <div class="panel"><h4>Top Scores</h4>${scoreRows(finding.top_scores)}</div>
-          <div class="panel"><h4>Bottom Scores</h4>${scoreRows(finding.bottom_scores)}</div>
+          <div class="panel">
+            <h4>Score Aggregation</h4>
+            <p><strong>Displayed:</strong> ${esc(finding.score_basis?.displayed_score || "get_leaderboard")}</p>
+            <p><strong>Task rows:</strong> ${esc(finding.score_basis?.task_distribution || "get_leaderboard_task")}</p>
+            ${taskDiagnostics((finding.task_score_diagnostics || []).slice(0, 5))}
+          </div>
           <div class="panel">
             <h4>Anomaly Records</h4>
             ${list((finding.anomaly_records || []).slice(0, 12).map((record) => `${record.kind}: ${record.text}`))}
