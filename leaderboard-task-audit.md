@@ -617,6 +617,7 @@ After generating the Step 3 tables, use subagents to inspect the extracted files
 - `agent/trajectory.json` when present, or the fact that it is missing
 - `verifier/test-stdout.txt` when present
 - `verifier/reward.txt` when present
+- `result.json` when present
 - `trial.log` when present
 
 **Output contract**

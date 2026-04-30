@@ -204,6 +204,22 @@ h1 {{
   margin: 0;
   padding-left: 18px;
 }}
+.chart-panel {{
+  margin: 0 0 16px;
+}
+.chart-panel.hidden {{
+  display: none;
+}
+.chart-frame {{
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.chart-caption {{
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
 .tabs {{
   display: flex;
   gap: 8px;
@@ -266,9 +282,13 @@ table {{
   min-width: 100%;
   border-collapse: collapse;
 }}
-.table-wrap[data-tab="merged"] table {{
+.table-wrap[data-tab="rerun"] table,
+.table-wrap[data-tab="high-difficulty"] table {{
   min-width: 2200px;
 }}
+.table-wrap[data-tab="high-difficulty"] table {{
+  min-width: 1100px;
+}
 thead {{
   background: #f8fafc;
 }}
@@ -291,6 +311,23 @@ tr:last-child td {{ border-bottom: 0; }}
 .count-good {{ color: var(--green); font-weight: 700; }}
 .row-missing td {{ background: #fff7ed; }}
 .row-all-ok td {{ background: #fff3e0; }}
+.task-group td {{
+  background: #eef4ff;
+  font-weight: 700;
+  border-top: 1px solid var(--line);
+}
+.task-child td:first-child {{
+  padding-left: 24px;
+}
+.task-summary td {{
+  background: #f8fafc;
+  font-weight: 700;
+  border-top: 1px dashed var(--line);
+}
+.task-score {{
+  color: var(--blue);
+  font-weight: 700;
+}
 .std-outlier {{ color: var(--orange); font-weight: 700; }}
 .hidden {{ display: none; }}
 .sort-indicator {{ margin-left: 6px; color: var(--blue); }}
@@ -324,6 +361,27 @@ tr:last-child td {{ border-bottom: 0; }}
   white-space: pre-wrap;
   word-break: break-word;
 }}
+.inline-help {{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-left: 6px;
+  border: 1px solid var(--blue);
+  border-radius: 999px;
+  background: #eff8ff;
+  color: var(--blue);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+  vertical-align: middle;
+}}
+.inline-help .tooltip-panel {{
+  left: auto;
+  right: 0;
+}
 .tooltip-wrap:hover .tooltip-panel {{
   display: block;
 }}
@@ -364,12 +422,32 @@ tr:last-child td {{ border-bottom: 0; }}
     </div>
   </div>
 
+  <div class="tabs">
+    <button class="tab active" data-tab="rerun">Re-run analysis</button>
+    <button class="tab" data-tab="high-difficulty">High Difficulty</button>
+  </div>
+
   <div class="controls">
     <input id="search" type="search" placeholder="Filter by task, agent, model, or pattern">
     <select id="task-filter"><option value="">All tasks</option></select>
     <select id="agent-filter"><option value="">All agents</option></select>
     <select id="model-filter"><option value="">All models</option></select>
     <button id="orange-only" class="toggle-filter" type="button" aria-pressed="false">Only orange rows</button>
+    <select id="difficulty-band" class="hidden">
+      <option value="">All tasks</option>
+      <option value="high">High difficulty (top 25%)</option>
+      <option value="above-median">Above median</option>
+      <option value="below-median">Below median</option>
+      <option value="low">Low difficulty (bottom 25%)</option>
+    </select>
+  </div>
+
+  <div id="difficulty-chart-panel" class="panel chart-panel hidden">
+    <h2>High Difficulty Chart</h2>
+    <p class="chart-caption">Ranked horizontal bar chart of task-level difficulty scores. `difficulty_score = 0.40 * low_reward_signal + 0.20 * low_ok_signal + 0.15 * failure_mix_signal + 0.15 * frontier_struggle_signal + 0.10 * variance_signal`.</p>
+    <div class="chart-frame">
+      <svg id="difficulty-chart" role="img" aria-label="High difficulty ranked bar chart"></svg>
+    </div>
   </div>
 
   <div class="table-wrap">
@@ -385,7 +463,7 @@ tr:last-child td {{ border-bottom: 0; }}
 const DATA = JSON.parse(document.getElementById("report-data").textContent);
 
 const tabDefs = {{
-  merged: {{
+  rerun: {{
     rows: DATA.combined_rows,
     columns: [
       "task",
@@ -395,16 +473,27 @@ const tabDefs = {{
       "exception_summary",
       "reward_mean",
       "reward_std",
+      "reasoning",
       "trajectory_json_path",
       "verifier_test_stdout_path",
       "error_category",
-      "matched_patterns",
-      "reasoning"
+      "matched_patterns"
+    ],
+  }},
+  "high-difficulty": {{
+    rows: DATA.combined_rows,
+    columns: [
+      "agent",
+      "model",
+      "n_trials",
+      "exception_summary",
+      "reward_mean",
+      "reward_std"
     ],
   }},
 }};
 
-let currentTab = "merged";
+let currentTab = "rerun";
 let sortState = {{ key: "", dir: "asc" }};
 
 function uniq(values) {{
@@ -447,6 +536,16 @@ function rowMatches(row) {{
   if (!search) return true;
   return Object.values(row).join(" ").toLowerCase().includes(search);
 }}
+
+function applyTabControlVisibility() {{
+  const orangeOnly = document.getElementById("orange-only");
+  const difficultyBand = document.getElementById("difficulty-band");
+  const chartPanel = document.getElementById("difficulty-chart-panel");
+  const isHighDifficulty = currentTab === "high-difficulty";
+  orangeOnly.classList.toggle("hidden", isHighDifficulty);
+  difficultyBand.classList.toggle("hidden", !isHighDifficulty);
+  chartPanel.classList.toggle("hidden", !isHighDifficulty);
+}
 
 function isMissingRow(row) {{
   return (
@@ -535,12 +634,301 @@ function compareValues(a, b, key) {{
   return String(a[key] || "").localeCompare(String(b[key] || ""));
 }}
 
+function parseExceptionSummary(summary) {{
+  const counts = new Map();
+  safeCell(summary).split(" | ").forEach(function (part) {{
+    if (!part) return;
+    const idx = part.lastIndexOf(":");
+    if (idx === -1) return;
+    const name = part.slice(0, idx).trim();
+    const count = Number(part.slice(idx + 1).trim());
+    if (!name || !Number.isFinite(count)) return;
+    counts.set(name, (counts.get(name) || 0) + count);
+  }});
+  return counts;
+}}
+
+function summarizeTaskRows(rows) {{
+  const exceptionCounts = new Map();
+  let totalTrials = 0;
+  let weightedMeanSum = 0;
+  let weightedSqSum = 0;
+  let rewardTrials = 0;
+  rows.forEach(function (row) {{
+    const n = Number(row.n_trials || 0);
+    totalTrials += n;
+    parseExceptionSummary(row.exception_summary).forEach(function (count, name) {{
+      exceptionCounts.set(name, (exceptionCounts.get(name) || 0) + count);
+    }});
+    const mean = Number(row.reward_mean);
+    if (Number.isFinite(mean) && n > 0) {{
+      weightedMeanSum += mean * n;
+      rewardTrials += n;
+      const std = Number(row.reward_std);
+      if (Number.isFinite(std)) {{
+        weightedSqSum += Math.max(0, n - 1) * std * std + n * mean * mean;
+      }} else {{
+        weightedSqSum += n * mean * mean;
+      }}
+    }}
+  }});
+  const rewardMean = rewardTrials ? weightedMeanSum / rewardTrials : null;
+  let rewardStd = null;
+  if (rewardTrials >= 2 && rewardMean !== null) {{
+    const variance = Math.max(0, (weightedSqSum - rewardTrials * rewardMean * rewardMean) / (rewardTrials - 1));
+    rewardStd = Math.sqrt(variance);
+  }}
+  const exceptionSummary = Array.from(exceptionCounts.entries())
+    .sort(function (a, b) {{ return b[1] - a[1] || a[0].localeCompare(b[0]); }})
+    .map(function ([name, count]) {{ return `${name}:${count}`; }})
+    .join(" | ");
+  return {{
+    n_trials: totalTrials,
+    ok_runs: rows.reduce(function (acc, row) {{ return acc + Number(row.ok_runs || 0); }}, 0),
+    exception_summary: exceptionSummary,
+    reward_mean: rewardMean,
+    reward_std: rewardStd,
+  }};
+}}
+
+function clamp01(value) {{
+  return Math.max(0, Math.min(1, value));
+}}
+
+function quantile(values, q) {{
+  const clean = values.filter(function (value) {{ return Number.isFinite(value); }}).slice().sort(function (a, b) {{ return a - b; }});
+  if (!clean.length) return null;
+  if (clean.length === 1) return clean[0];
+  const pos = (clean.length - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  if (lo === hi) return clean[lo];
+  const frac = pos - lo;
+  return clean[lo] * (1 - frac) + clean[hi] * frac;
+}}
+
+function usesBoundedScores(rows) {{
+  const rewards = rows
+    .map(function (row) {{ return Number(row.reward_mean); }})
+    .filter(function (value) {{ return Number.isFinite(value); }});
+  return rewards.length > 0 && rewards.every(function (value) {{ return value >= 0 && value <= 1; }});
+}}
+
+function lowRewardSignal(rewardMean, bounded, rewardMeans) {{
+  if (!Number.isFinite(rewardMean)) return 1;
+  if (bounded) return clamp01((0.5 - rewardMean) / 0.5);
+  const q25 = quantile(rewardMeans, 0.25);
+  const q75 = quantile(rewardMeans, 0.75);
+  if (!Number.isFinite(q25) || !Number.isFinite(q75) || q75 <= q25) return 0;
+  return clamp01((q75 - rewardMean) / (q75 - q25));
+}}
+
+function lowOkSignal(okRate) {{
+  if (!Number.isFinite(okRate)) return 1;
+  return clamp01((0.6 - okRate) / 0.6);
+}}
+
+function failureMixSignal(okRate) {{
+  if (!Number.isFinite(okRate)) return 1;
+  const failureRate = 1 - okRate;
+  return clamp01(failureRate / 0.25);
+}}
+
+function rowDifficultySignal(row, bounded) {{
+  const n = Number(row.n_trials || 0);
+  const okRuns = Number(row.ok_runs || 0);
+  const okRate = n > 0 ? okRuns / n : 0;
+  const rewardMean = Number(row.reward_mean);
+  const okSignal = lowOkSignal(okRate);
+  const rewardSignal = lowRewardSignal(rewardMean, bounded, []);
+  return Math.max(okSignal, rewardSignal);
+}}
+
+function frontierStruggleSignal(rows, bounded) {{
+  const targets = [
+    ["gpt-5.4", "codex"],
+    ["claude-opus-4-6", "claude-code"],
+    ["gemini-3.1-pro-preview", "gemini-cli"],
+  ];
+  const keyed = new Map(rows.map(function (row) {{ return [`${row.model}@@${row.agent}`, row]; }}));
+  let seen = 0;
+  let total = 0;
+  targets.forEach(function ([model, agent]) {{
+    const row = keyed.get(`${model}@@${agent}`);
+    if (!row) return;
+    seen += 1;
+    total += rowDifficultySignal(row, bounded);
+  }});
+  return seen ? total / seen : 0;
+}}
+
+function varianceSignal(taskStd, stdP75, stdP90) {{
+  if (!Number.isFinite(taskStd) || !Number.isFinite(stdP75) || !Number.isFinite(stdP90)) return 0;
+  if (taskStd <= stdP75) return 0;
+  if (stdP90 <= stdP75) return 1;
+  return clamp01((taskStd - stdP75) / (stdP90 - stdP75));
+}}
+
+function computeDifficultyScores(grouped) {{
+  const tasks = Array.from(grouped.keys());
+  const bounded = usesBoundedScores(DATA.combined_rows);
+  const rawSummaries = tasks.map(function (task) {{
+    const rows = grouped.get(task);
+    const summary = summarizeTaskRows(rows);
+    const rewardMean = Number(summary.reward_mean);
+    const okRate = summary.n_trials > 0 ? summary.ok_runs / summary.n_trials : 0;
+    return {{
+      task: task,
+      rows: rows,
+      summary: summary,
+      reward_mean: rewardMean,
+      ok_rate: okRate,
+    }};
+  }});
+  const rewardMeans = rawSummaries.map(function (item) {{ return item.reward_mean; }}).filter(Number.isFinite);
+  const taskStds = rawSummaries.map(function (item) {{ return Number(item.summary.reward_std); }}).filter(Number.isFinite);
+  const stdP75 = quantile(taskStds, 0.75);
+  const stdP90 = quantile(taskStds, 0.90);
+  rawSummaries.forEach(function (item) {{
+    const lowReward = lowRewardSignal(item.reward_mean, bounded, rewardMeans);
+    const lowOk = lowOkSignal(item.ok_rate);
+    const failureMix = failureMixSignal(item.ok_rate);
+    const frontier = frontierStruggleSignal(item.rows, bounded);
+    const variance = varianceSignal(Number(item.summary.reward_std), stdP75, stdP90);
+    // Higher scores mean "harder-looking" tasks: poor reward outcomes dominate,
+    // then low completion, exception burden, frontier-pair struggle, and variance as weaker support signals.
+    item.summary.difficulty_score = clamp01(
+      0.40 * lowReward +
+      0.20 * lowOk +
+      0.15 * failureMix +
+      0.15 * frontier +
+      0.10 * variance
+    );
+  }});
+  rawSummaries.sort(function (a, b) {{
+    const scoreDiff = (b.summary.difficulty_score || 0) - (a.summary.difficulty_score || 0);
+    if (scoreDiff !== 0) return scoreDiff;
+    return (a.reward_mean || Infinity) - (b.reward_mean || Infinity);
+  }});
+  const difficultyScores = rawSummaries
+    .map(function (item) {{ return Number(item.summary.difficulty_score); }})
+    .filter(Number.isFinite);
+  return {
+    items: rawSummaries,
+    thresholds: {
+      p25: quantile(difficultyScores, 0.25),
+      p50: quantile(difficultyScores, 0.50),
+      p75: quantile(difficultyScores, 0.75),
+    },
+  };
+}}
+
 function buildHeadHtml(columns) {{
   return columns.map(function (col) {{
     const indicator = sortState.key === col ? `<span class="sort-indicator">${sortState.dir === "asc" ? "↑" : "↓"}</span>` : "";
     return `<th data-col="${col}">${col.replaceAll("_", " ")}${indicator}</th>`;
   }}).join("");
 }}
+
+function difficultyHeaderHtml() {{
+  return `difficulty score`
+    + `<div class="tooltip-wrap inline-help" aria-label="Difficulty score help">?`
+    + `<div class="tooltip-panel"><pre style="margin:0; font: inherit; white-space: pre-wrap;">difficulty_score = 0.40 * low_reward_signal
++ 0.20 * low_ok_signal
++ 0.15 * failure_mix_signal
++ 0.15 * frontier_struggle_signal
++ 0.10 * variance_signal
+
+failure_mix_signal is a low-gravity signal for non-OK trials, so a task with some exceptions can score low-but-nonzero instead of 0.000.</pre></div>`
+    + `</div>`;
+}
+
+function buildHighDifficultyHeadHtml() {{
+  const columns = [
+    ["agent", "agent"],
+    ["model", "model"],
+    ["n_trials", "n trials"],
+    ["exception_summary", "exception summary"],
+    ["reward_mean", "reward mean"],
+    ["reward_std", "reward std"],
+    ["difficulty_score", difficultyHeaderHtml()],
+  ];
+  return columns.map(function ([key, label]) {{
+    const active = sortState.key === key;
+    const indicator = active ? `<span class="sort-indicator">${sortState.dir === "asc" ? "↑" : "↓"}</span>` : "";
+    return `<th data-col="${key}">${label}${indicator}</th>`;
+  }}).join("");
+}
+
+function compareTaskSummaries(a, b, key) {{
+  const aSummary = a.summary || {};
+  const bSummary = b.summary || {};
+  if (key === "difficulty_score") return Number(aSummary.difficulty_score || 0) - Number(bSummary.difficulty_score || 0);
+  if (key === "n_trials") return Number(aSummary.n_trials || 0) - Number(bSummary.n_trials || 0);
+  if (key === "reward_mean") return Number(aSummary.reward_mean || 0) - Number(bSummary.reward_mean || 0);
+  if (key === "reward_std") return Number(aSummary.reward_std || 0) - Number(bSummary.reward_std || 0);
+  if (key === "exception_summary") return String(aSummary.exception_summary || "").localeCompare(String(bSummary.exception_summary || ""));
+  if (key === "agent") {{
+    const aAgent = a.rows.map(function (row) {{ return String(row.agent || ""); }}).sort()[0] || "";
+    const bAgent = b.rows.map(function (row) {{ return String(row.agent || ""); }}).sort()[0] || "";
+    return aAgent.localeCompare(bAgent);
+  }}
+  if (key === "model") {{
+    const aModel = a.rows.map(function (row) {{ return String(row.model || ""); }}).sort()[0] || "";
+    const bModel = b.rows.map(function (row) {{ return String(row.model || ""); }}).sort()[0] || "";
+    return aModel.localeCompare(bModel);
+  }}
+  return String(a.task || "").localeCompare(String(b.task || ""));
+}
+
+function escapeAttr(value) {{
+  return escapeHtml(value).replaceAll("'", "&#39;");
+}
+
+function difficultyBandColor(score, thresholds) {{
+  if (!Number.isFinite(score)) return "#98a2b3";
+  if (Number.isFinite(thresholds.p75) && score >= thresholds.p75) return "#175cd3";
+  if (Number.isFinite(thresholds.p50) && score >= thresholds.p50) return "#36b37e";
+  if (Number.isFinite(thresholds.p25) && score < thresholds.p25) return "#98a2b3";
+  return "#f79009";
+}
+
+function renderDifficultyChart(items, thresholds) {{
+  const svg = document.getElementById("difficulty-chart");
+  if (!items.length) {{
+    svg.setAttribute("width", "960");
+    svg.setAttribute("height", "80");
+    svg.innerHTML = `<text x="24" y="40" fill="#667085" font-size="14">No tasks match the current difficulty filter.</text>`;
+    return;
+  }}
+  const leftPad = 260;
+  const rightPad = 40;
+  const topPad = 24;
+  const bottomPad = 30;
+  const rowHeight = 28;
+  const barHeight = 18;
+  const chartWidth = 960;
+  const barAreaWidth = chartWidth - leftPad - rightPad;
+  const height = topPad + bottomPad + items.length * rowHeight;
+  svg.setAttribute("width", String(chartWidth));
+  svg.setAttribute("height", String(height));
+  const gridLines = [0, 0.25, 0.5, 0.75, 1].map(function (tick) {{
+    const x = leftPad + tick * barAreaWidth;
+    return `<g><line x1="${x}" y1="${topPad - 8}" x2="${x}" y2="${height - bottomPad + 4}" stroke="#d0d5dd" stroke-dasharray="3 3"></line><text x="${x}" y="${height - 8}" text-anchor="middle" fill="#667085" font-size="11">${tick.toFixed(2)}</text></g>`;
+  }}).join("");
+  const bars = items.map(function (item, index) {{
+    const score = Number(item.summary.difficulty_score || 0);
+    const y = topPad + index * rowHeight;
+    const width = Math.max(0, score) * barAreaWidth;
+    const color = difficultyBandColor(score, thresholds);
+    return `<g>`
+      + `<text x="${leftPad - 12}" y="${y + 13}" text-anchor="end" fill="#17202a" font-size="12">${escapeHtml(item.task)}</text>`
+      + `<rect x="${leftPad}" y="${y}" width="${width}" height="${barHeight}" rx="4" fill="${color}"><title>${escapeAttr(item.task)}: ${score.toFixed(3)}</title></rect>`
+      + `<text x="${leftPad + width + 8}" y="${y + 13}" fill="#17202a" font-size="12">${score.toFixed(3)}</text>`
+      + `</g>`;
+  }}).join("");
+  svg.innerHTML = gridLines + bars;
+}
 
 function bindHeadClicks() {{
   document.querySelectorAll("#head-row th[data-col]").forEach(function (th) {{
@@ -563,6 +951,73 @@ function renderTable() {{
   const body = document.getElementById("body-rows");
   const wrap = document.querySelector(".table-wrap");
   wrap.dataset.tab = currentTab;
+  applyTabControlVisibility();
+  if (currentTab === "high-difficulty") {{
+    if (!sortState.key) {{
+      sortState.key = "difficulty_score";
+      sortState.dir = "desc";
+    }}
+    head.innerHTML = buildHighDifficultyHeadHtml();
+    bindHeadClicks();
+    const grouped = new Map();
+    def.rows.filter(rowMatches).forEach(function (row) {{
+      if (!grouped.has(row.task)) grouped.set(row.task, []);
+      grouped.get(row.task).push(row);
+    }});
+    const scored = computeDifficultyScores(grouped);
+    const thresholds = scored.thresholds || {};
+    const difficultyBand = document.getElementById("difficulty-band").value;
+    let taskSummaries = scored.items;
+    if (difficultyBand === "high" && Number.isFinite(thresholds.p75)) {{
+      taskSummaries = taskSummaries.filter(function (item) {{ return Number(item.summary.difficulty_score) >= thresholds.p75; }});
+    }} else if (difficultyBand === "above-median" && Number.isFinite(thresholds.p50)) {{
+      taskSummaries = taskSummaries.filter(function (item) {{ return Number(item.summary.difficulty_score) >= thresholds.p50; }});
+    }} else if (difficultyBand === "below-median" && Number.isFinite(thresholds.p50)) {{
+      taskSummaries = taskSummaries.filter(function (item) {{ return Number(item.summary.difficulty_score) < thresholds.p50; }});
+    }} else if (difficultyBand === "low" && Number.isFinite(thresholds.p25)) {{
+      taskSummaries = taskSummaries.filter(function (item) {{ return Number(item.summary.difficulty_score) < thresholds.p25; }});
+    }}
+    taskSummaries.sort(function (a, b) {{
+      const cmp = compareTaskSummaries(a, b, sortState.key || "difficulty_score");
+      return sortState.dir === "asc" ? cmp : -cmp;
+    }});
+    renderDifficultyChart(taskSummaries, thresholds);
+    body.innerHTML = taskSummaries.map(function (item) {{
+      const task = item.task;
+      const rows = item.rows.slice().sort(function (a, b) {{
+        const agentCmp = String(a.agent || "").localeCompare(String(b.agent || ""));
+        if (agentCmp !== 0) return agentCmp;
+        return String(a.model || "").localeCompare(String(b.model || ""));
+      }});
+      const summary = item.summary;
+      const groupHeader = `<tr class="task-group"><td colspan="7">${escapeHtml(task)}</td></tr>`;
+      const children = rows.map(function (row) {{
+        const highlightMissing = isMissingRow(row);
+        const highlightAllOk = isOrangeRow(row);
+        const rowClass = highlightMissing ? "task-child row-missing" : highlightAllOk ? "task-child row-all-ok" : "task-child";
+        return `<tr class="${rowClass}">`
+          + `<td class="${cellClass("agent", row.agent, row)}">${renderCell("agent", row.agent, row)}</td>`
+          + `<td class="${cellClass("model", row.model, row)}">${renderCell("model", row.model, row)}</td>`
+          + `<td class="${cellClass("n_trials", row.n_trials, row)}">${renderCell("n_trials", row.n_trials, row)}</td>`
+          + `<td class="${cellClass("exception_summary", row.exception_summary, row)}">${renderCell("exception_summary", row.exception_summary, row)}</td>`
+          + `<td class="${cellClass("reward_mean", row.reward_mean, row)}">${renderCell("reward_mean", row.reward_mean, row)}</td>`
+          + `<td class="${cellClass("reward_std", row.reward_std, row)}">${renderCell("reward_std", row.reward_std, row)}</td>`
+          + `<td></td>`
+          + `</tr>`;
+      }}).join("");
+      const summaryRow = `<tr class="task-summary">`
+        + `<td>Task total</td>`
+        + `<td></td>`
+        + `<td class="mono">${summary.n_trials || ""}</td>`
+        + `<td>${escapeHtml(summary.exception_summary || "")}</td>`
+        + `<td class="mono">${summary.reward_mean == null ? "" : summary.reward_mean.toFixed(6)}</td>`
+        + `<td class="mono">${summary.reward_std == null ? "" : summary.reward_std.toFixed(6)}</td>`
+        + `<td class="mono task-score">${summary.difficulty_score == null ? "" : summary.difficulty_score.toFixed(3)}</td>`
+        + `</tr>`;
+      return groupHeader + children + summaryRow;
+    }}).join("");
+    return;
+  }}
   head.innerHTML = buildHeadHtml(def.columns);
   bindHeadClicks();
   const rows = def.rows.filter(rowMatches).slice().sort(function (a, b) {{
@@ -578,7 +1033,18 @@ function renderTable() {{
   }}).join("");
 }}
 
-for (const id of ["search", "task-filter", "agent-filter", "model-filter", "orange-only"]) {{
+for (const tab of document.querySelectorAll(".tab")) {{
+  tab.addEventListener("click", () => {{
+    currentTab = tab.dataset.tab;
+    sortState = currentTab === "high-difficulty"
+      ? { key: "difficulty_score", dir: "desc" }
+      : { key: "", dir: "asc" };
+    document.querySelectorAll(".tab").forEach(el => el.classList.toggle("active", el === tab));
+    renderTable();
+  }});
+}}
+
+for (const id of ["search", "task-filter", "agent-filter", "model-filter", "orange-only", "difficulty-band"]) {{
   document.getElementById(id).addEventListener("input", renderTable);
   document.getElementById(id).addEventListener("change", renderTable);
 }}
