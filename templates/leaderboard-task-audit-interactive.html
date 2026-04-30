@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leaderboard Audit</title>
+<style>
+:root {
+  --bg: #f6f7f9;
+  --paper: #ffffff;
+  --ink: #17202a;
+  --muted: #667085;
+  --line: #d0d5dd;
+  --red: #b42318;
+  --orange: #b54708;
+  --green: #067647;
+  --blue: #175cd3;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+}
+
+header {
+  padding: 34px clamp(18px, 4vw, 56px) 22px;
+  border-bottom: 1px solid var(--line);
+}
+
+h1 {
+  margin: 0 0 8px;
+  font-size: clamp(30px, 5vw, 58px);
+  letter-spacing: 0;
+  line-height: 0.95;
+}
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 24px;
+}
+
+.meta {
+  max-width: 900px;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.wrap {
+  padding: 22px clamp(18px, 4vw, 56px) 48px;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.stat {
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+}
+
+.stat b {
+  display: block;
+  font-size: 28px;
+}
+
+.stat span {
+  color: var(--muted);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: 2fr repeat(4, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 18px 0;
+}
+
+input,
+select {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+}
+
+section {
+  margin-top: 24px;
+}
+
+.summary {
+  display: grid;
+  gap: 9px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.summary li {
+  padding: 12px 14px;
+  border-left: 5px solid var(--blue);
+  border-radius: 8px;
+  background: var(--paper);
+}
+
+.cards {
+  display: grid;
+  gap: 14px;
+}
+
+.card {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+}
+
+.card-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 16px 18px;
+  cursor: pointer;
+}
+
+.title {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  align-items: center;
+}
+
+.title h3 {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: -0.02em;
+}
+
+.badge {
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.p1 {
+  background: #fee4e2;
+  color: var(--red);
+}
+
+.p2 {
+  background: #fef0c7;
+  color: var(--orange);
+}
+
+.p3 {
+  background: #eaecf0;
+  color: #344054;
+}
+
+.cause {
+  background: #ecfdf3;
+  color: var(--green);
+}
+
+.verdict {
+  background: #eff8ff;
+  color: var(--blue);
+}
+
+.card p {
+  margin: 7px 0;
+}
+
+.card-body {
+  display: none;
+  padding: 0 18px 18px;
+  border-top: 1px solid var(--line);
+}
+
+.card.open .card-body {
+  display: block;
+}
+
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.panel {
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fcfcfd;
+}
+
+.panel h4 {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+ul.compact {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.score-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 0;
+  border-bottom: 1px dashed #d0d5dd;
+  font-size: 13px;
+}
+
+.score-row.flagged {
+  margin: 3px -6px;
+  padding: 6px;
+  border: 1px solid #fdb022;
+  border-radius: 6px;
+  background: #fffaeb;
+}
+
+.score-main {
+  min-width: 0;
+}
+
+.score-tags {
+  display: block;
+  margin-top: 2px;
+  color: var(--orange);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.action {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+}
+
+.action h3 {
+  margin: 0 0 8px;
+  font-size: 17px;
+}
+
+.empty {
+  padding: 16px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--muted);
+}
+
+@media (max-width: 900px) {
+  .stats,
+  .controls,
+  .grid2,
+  .action-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .card-head {
+    flex-direction: column;
+  }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Leaderboard Anomaly Report</h1>
+  <div class="meta" id="meta"></div>
+</header>
+
+<div class="wrap">
+  <div class="stats">
+    <div class="stat"><b id="benchmarks-seen">0</b><span>Benchmarks Seen</span></div>
+    <div class="stat"><b id="benchmarks-flagged">0</b><span>Flagged</span></div>
+    <div class="stat"><b id="benchmarks-clean">0</b><span>Clean</span></div>
+    <div class="stat"><b id="rows-analyzed">0</b><span>Rows Analyzed</span></div>
+  </div>
+
+  <section>
+    <h2>Trend Summary</h2>
+    <ul class="summary" id="summary"></ul>
+  </section>
+
+  <section>
+    <h2>Flagged Benchmarks</h2>
+    <div class="controls">
+      <input id="q" placeholder="Search benchmark, anomaly, tags...">
+      <select id="cause"><option value="">All root causes</option></select>
+      <select id="verdict"><option value="">All parity verdicts</option></select>
+      <select id="priority">
+        <option value="">All priorities</option>
+        <option value="1">Priority 1</option>
+        <option value="2">Priority 2</option>
+        <option value="3">Priority 3</option>
+      </select>
+      <select id="sort">
+        <option value="priority">Sort by priority</option>
+        <option value="benchmark">Sort by benchmark</option>
+      </select>
+    </div>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <section>
+    <h2>Action Queue</h2>
+    <div class="action-grid" id="actions"></div>
+  </section>
+
+  <section>
+    <h2>Clean Benchmarks</h2>
+    <p id="clean"></p>
+  </section>
+</div>
+
+<script id="report-data" type="application/json">
+%%REPORT_DATA_JSON%%
+</script>
+
+<script>
+function parseReportData() {
+  const raw = document.getElementById("report-data").textContent.trim();
+  if (!raw || raw[0] !== "{") {
+    throw new Error("Missing embedded report data.");
+  }
+  return JSON.parse(raw);
+}
+
+const data = parseReportData();
+const get = (id) => document.getElementById(id);
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  "\"": "&quot;",
+  "'": "&#39;"
+}[char]));
+
+function formatInt(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function optionize(id, values) {
+  values.sort().forEach((value) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    get(id).appendChild(option);
+  });
+}
+
+function list(items) {
+  if (!items || !items.length) return "<p>none</p>";
+  return `<ul class="compact">${items.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>`;
+}
+
+function anomalyMap(finding) {
+  const map = new Map();
+  (finding.anomaly_score_keys || []).forEach((item) => {
+    map.set(`${item.model}|||${item.agent}`, item.tags || []);
+  });
+  return map;
+}
+
+function scoreRows(rows, finding) {
+  if (!rows || !rows.length) return "<p>none</p>";
+  const flags = anomalyMap(finding || {});
+  return rows.map((row) => `
+    ${(() => {
+      const tags = flags.get(`${row.model}|||${row.agent}`) || [];
+      const flagged = tags.length > 0;
+      return `<div class="score-row ${flagged ? "flagged" : ""}">
+      <span class="score-main">${esc(row.model)} / ${esc(row.agent)}${flagged ? `<span class="score-tags">${esc(tags.join(", "))}</span>` : ""}</span>
+      <strong>${Number(row.score || 0).toFixed(3)}</strong>
+    </div>`;
+    })()}
+  `).join("");
+}
+
+function taskDiagnostics(rows) {
+  if (!rows || !rows.length) return "<p>none</p>";
+  return rows.map((row) => `
+    ${(() => {
+      const delta = Number(row.mean_minus_displayed || 0);
+      const differs = Math.abs(delta) >= 0.0005;
+      const displayed = Number(row.displayed_score || 0).toFixed(3);
+      const taskMean = Number(row.task_mean || 0).toFixed(3);
+      const scoreText = differs ? `${displayed} vs ${taskMean}` : displayed;
+      const detailText = differs
+        ? `task mean differs · median ${Number(row.task_median || 0).toFixed(3)} · range ${Number(row.task_min || 0).toFixed(3)}-${Number(row.task_max || 0).toFixed(3)} · n=${esc(row.task_rows)}`
+        : `task mean matches displayed · median ${Number(row.task_median || 0).toFixed(3)} · range ${Number(row.task_min || 0).toFixed(3)}-${Number(row.task_max || 0).toFixed(3)} · n=${esc(row.task_rows)}`;
+      return `
+    <div class="score-row">
+      <span>${esc(row.model)} / ${esc(row.agent)}</span>
+      <strong>${scoreText}</strong>
+    </div>
+    <div class="score-row">
+      <span>${detailText}</span>
+      <strong>${differs ? delta.toFixed(3) : ""}</strong>
+    </div>
+      `;
+    })()}
+  `).join("");
+}
+
+function archiveCategoryRows(analysis) {
+  if (!analysis || !analysis.archives_seen) return "<p>No downloaded trial archives found.</p>";
+  const counts = analysis.category_counts || {};
+  const categoryRows = Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([category, count]) => `
+    <div class="score-row">
+      <span>${esc(category)}</span>
+      <strong>${esc(count)}</strong>
+    </div>
+  `).join("");
+  const modelRows = (analysis.model_agent_category_counts || []).slice(0, 8).map((row) => `
+    <div class="score-row">
+      <span>${esc(row.model)} / ${esc(row.agent)} · ${esc(row.category)}</span>
+      <strong>${esc(row.count)}</strong>
+    </div>
+  `).join("");
+  return `
+    <p><strong>Source:</strong> ${esc(analysis.source_dir || "")}</p>
+    <p><strong>Archives scanned:</strong> ${esc(analysis.archives_seen)}</p>
+    ${categoryRows || "<p>none</p>"}
+    <h4>Top Model-Agent Categories</h4>
+    ${modelRows || "<p>none</p>"}
+  `;
+}
+
+function archiveSamples(analysis) {
+  const samples = (analysis && analysis.samples) || [];
+  if (!samples.length) return "<p>none</p>";
+  return `<ul class="compact">${samples.slice(0, 12).map((sample) => `
+    <li>
+      <strong>${esc(sample.category)}</strong> · ${esc(sample.task_name)} · ${esc(sample.model)} / ${esc(sample.agent)}
+      <br><span>${esc(sample.reason || "")}${sample.exception_type ? ` · ${esc(sample.exception_type)}` : ""}</span>
+    </li>
+  `).join("")}</ul>`;
+}
+
+function ownerSummary(owner) {
+  if (!owner || !owner.people) return "not mapped";
+  return owner.adapter_name ? `${owner.people} · ${owner.adapter_name}` : owner.people;
+}
+
+function ownerDetails(owner) {
+  if (!owner || !owner.people) return "<p>not mapped</p>";
+  return `
+    <p><strong>People:</strong> ${esc(owner.people)}</p>
+    <p><strong>Adapter:</strong> ${esc(owner.adapter_name || "unknown")}</p>
+  `;
+}
+
+function parityLabel(finding) {
+  if (!finding.parity_link) return "<strong>Parity:</strong>";
+  return `<strong><a href="${esc(finding.parity_link)}" target="_blank" rel="noopener">Parity</a>:</strong>`;
+}
+
+function renderMeta() {
+  const focus = data.meta?.focus_benchmark;
+  if (focus) {
+    document.querySelector("h1").textContent = `Benchmark Audit: ${focus}`;
+    document.querySelector("section h2").textContent = "Benchmark Summary";
+    const flaggedTitle = document.querySelectorAll("section h2")[1];
+    if (flaggedTitle) flaggedTitle.textContent = "Finding";
+    const controls = document.querySelector(".controls");
+    if (controls) controls.style.display = "none";
+  }
+  get("meta").textContent = `Generated ${data.meta?.generated_at || data.meta?.date || "unknown"}. ${data.meta?.scope || ""}`;
+  get("benchmarks-seen").textContent = formatInt(data.meta?.benchmarks_seen);
+  get("benchmarks-flagged").textContent = formatInt(data.meta?.benchmarks_flagged || data.findings?.length);
+  get("benchmarks-clean").textContent = formatInt((data.meta?.clean_benchmarks || []).length);
+  get("rows-analyzed").textContent = formatInt(data.meta?.rows_analyzed);
+  get("clean").textContent = (data.meta?.clean_benchmarks || []).join(", ") || "none";
+}
+
+function renderSummary() {
+  const findings = data.summary?.headline_findings || [];
+  const notes = data.summary?.analysis_notes || [];
+  get("summary").innerHTML = [
+    ...findings.map((line) => `<li>${esc(line)}</li>`),
+    ...notes.map((line) => `<li><strong>Note:</strong> ${esc(line)}</li>`)
+  ].join("");
+}
+
+function renderActions() {
+  const queue = data.action_queue || {};
+  get("actions").innerHTML = Object.entries(queue).map(([category, items]) => `
+    <div class="action">
+      <h3>${esc(category)} (${items.length})</h3>
+      ${list(items.slice(0, 10))}
+    </div>
+  `).join("");
+}
+
+function renderCards() {
+  const query = get("q").value.toLowerCase();
+  const cause = get("cause").value;
+  const verdict = get("verdict").value;
+  const priority = get("priority").value;
+  const sort = get("sort").value;
+
+  let findings = data.findings || [];
+  findings = findings.filter((finding) => (
+    (!cause || finding.root_cause === cause) &&
+    (!verdict || finding.parity_verdict === verdict) &&
+    (!priority || String(finding.priority) === priority)
+  ));
+
+  if (query) {
+    findings = findings.filter((finding) => JSON.stringify([
+      finding.benchmark,
+      finding.anomaly,
+      finding.root_cause,
+      finding.parity_verdict,
+      finding.historical_trend,
+      finding.tags,
+      finding.parity,
+      finding.historical,
+      finding.task_score_diagnostics
+    ]).toLowerCase().includes(query));
+  }
+
+  findings.sort((a, b) => {
+    if (sort === "benchmark") return a.benchmark.localeCompare(b.benchmark);
+    return (a.priority - b.priority) || a.benchmark.localeCompare(b.benchmark);
+  });
+
+  if (!findings.length) {
+    get("cards").innerHTML = '<div class="empty">No findings match the active filters.</div>';
+    return;
+  }
+
+  const singleMode = Boolean(data.meta?.focus_benchmark) && findings.length === 1;
+  get("cards").innerHTML = findings.map((finding) => `
+    <article class="card ${singleMode ? "open" : ""}">
+      <div class="card-head" onclick="this.parentElement.classList.toggle('open')">
+        <div>
+          <div class="title">
+            <h3>${esc(finding.benchmark)}</h3>
+            <span class="badge p${esc(finding.priority)}">P${esc(finding.priority)}</span>
+            <span class="badge cause">${esc(finding.root_cause)}</span>
+            <span class="badge verdict">${esc(finding.parity_verdict)}</span>
+          </div>
+          <p>${esc(finding.anomaly)}</p>
+          <p><strong>Experiment owner:</strong> ${esc(ownerSummary(finding.experiment_owner))}</p>
+        </div>
+        <span>${singleMode ? "collapse" : "expand"}</span>
+      </div>
+      <div class="card-body">
+        <div class="grid2">
+          <div class="panel">
+            <h4>Evidence</h4>
+            <p>${parityLabel(finding)} ${esc(finding.parity)}</p>
+            <p><strong>History:</strong> ${esc(finding.historical)}</p>
+            <p><strong>Action:</strong> ${esc(finding.recommended_action)}</p>
+          </div>
+          <div class="panel">
+            <h4>Tags</h4>
+            <p>${esc((finding.tags || []).join(", ")) || "none"}</p>
+            <h4>Zero / Near-zero</h4>
+            <p>Near-zero: ${(finding.near_zero_outliers || []).length} shown; exact-zero tasks: ${(finding.exact_zero_tasks || []).length} shown.</p>
+          </div>
+          <div class="panel"><h4>Top Scores</h4>${scoreRows(finding.top_scores, finding)}</div>
+          <div class="panel"><h4>Bottom Scores</h4>${scoreRows(finding.bottom_scores, finding)}</div>
+          <div class="panel"><h4>Experiment Owner</h4>${ownerDetails(finding.experiment_owner)}</div>
+          <div class="panel">
+            <h4>Score Aggregation</h4>
+            <p><strong>Displayed:</strong> ${esc(finding.score_basis?.displayed_score || "get_leaderboard")}</p>
+            <p><strong>Task rows:</strong> ${esc(finding.score_basis?.task_distribution || "get_leaderboard_task")}</p>
+            ${taskDiagnostics((finding.task_score_diagnostics || []).slice(0, 5))}
+          </div>
+          <div class="panel">
+            <h4>Trial Archive Categories</h4>
+            ${archiveCategoryRows(finding.trial_archive_analysis)}
+          </div>
+          <div class="panel">
+            <h4>Trial Archive Samples</h4>
+            ${archiveSamples(finding.trial_archive_analysis)}
+          </div>
+          <div class="panel">
+            <h4>Anomaly Records</h4>
+            ${list((finding.anomaly_records || []).slice(0, 12).map((record) => `${record.kind}: ${record.text}`))}
+          </div>
+          <div class="panel">
+            <h4>Exact-Zero Tasks</h4>
+            ${list((finding.exact_zero_tasks || []).slice(0, 12))}
+          </div>
+        </div>
+      </div>
+    </article>
+  `).join("");
+}
+
+function init() {
+  optionize("cause", [...new Set((data.findings || []).map((finding) => finding.root_cause).filter(Boolean))]);
+  optionize("verdict", [...new Set((data.findings || []).map((finding) => finding.parity_verdict).filter(Boolean))]);
+  ["q", "cause", "verdict", "priority", "sort"].forEach((id) => {
+    get(id).addEventListener("input", renderCards);
+  });
+  renderMeta();
+  renderSummary();
+  renderActions();
+  renderCards();
+}
+
+init();
+</script>
+</body>
+</html>
