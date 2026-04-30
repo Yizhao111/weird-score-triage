@@ -622,14 +622,21 @@ After generating the Step 3 tables, use subagents to inspect the extracted files
 
 **Output contract**
 - Write `/tmp/<benchmark>_step3_tables/reasoning.tsv`
-- Columns: `task`, `agent`, `model`, `reasoning`
+- Columns: `task`, `agent`, `model`, `reasoning`, `rerun_recommendation`, `rerun_justification`
 - `reasoning` must be evidence-based and no more than 4 sentences
 - Mention the dominant exception or missing-file pattern, whether the agent appears to have started, and whether the verifier appears to have run
+- `rerun_recommendation` must be one of `yes`, `maybe`, or `no`
+- `rerun_justification` must be concise and explain the rerun call using the benchmark policy below
+
+**Rerun policy for subagents**
+- Valid reruns: rate-limit failures, Daytona/platform failures, `CancelledError`, and selected `NonZeroAgentExitCodeError` cases without API-policy or refusal signals
+- Usually not reruns: `RewardFileNotFoundError`, `AgentTimeoutError`, `VerifierTimeoutError`, stable wrong-answer behavior, and clear policy/refusal blocks
+- The final HTML rerun summary is built from a merged pass: prefer subagent `rerun_recommendation` and `rerun_justification` when present, then fall back to the local heuristic pass for uncovered rows
 
 **Subagent fan-out requirement**
-- Split the orange rows across **4 subagents**.
-- If the orchestrator is **Codex**, use **`gpt-5.4-mini`** for the 4 subagents.
-- If the orchestrator is **Claude Code**, use **Claude 4.5 Haiku** for the 4 subagents.
+- Split the orange rows across **8 subagents**.
+- If the orchestrator is **Codex**, use **`gpt-5.4-mini`** for the 8 subagents.
+- If the orchestrator is **Claude Code**, use **Claude 4.5 Haiku** for the 8 subagents.
 - Assign each subagent a disjoint slice of orange rows so ownership is clear and the outputs can be merged without collisions.
 - Merge the 8 partial outputs into a single `/tmp/<benchmark>_step3_tables/reasoning.tsv` keyed by `task`, `agent`, and `model`.
 
@@ -643,7 +650,7 @@ After generating the Step 3 tables, use subagents to inspect the extracted files
 **Suggested Codex prompt**
 
 ```text
-Analyze the assigned orange-highlighted Step 3 rows for <benchmark>. For each assigned (task, agent, model) cell that is not all-OK, inspect exception.txt, agent/trajectory.json, and verifier/test-stdout.txt under /tmp/<benchmark>/. Write a partial TSV with columns task, agent, model, reasoning. Each reasoning must be evidence-based, no more than 4 sentences, and explain why the row is flagged.
+Analyze the assigned orange-highlighted Step 3 rows for <benchmark>. For each assigned (task, agent, model) cell that is not all-OK, inspect exception.txt, agent/trajectory.json, verifier/test-stdout.txt, and other local trial artifacts under /tmp/<benchmark>/ when useful. Write a partial TSV with columns task, agent, model, reasoning, rerun_recommendation, rerun_justification. Keep reasoning evidence-based and under 4 sentences, explain why the row is flagged, and classify reruns conservatively: yes for transient infra/quota/cancellation patterns, maybe for ambiguous NonZeroAgentExitCodeError cases without policy signals, and no for RewardFileNotFoundError, AgentTimeoutError, verifier timeout, policy/refusal, or stable behavior failures.
 ```
 
 ### Step 3d — Render the HTML report

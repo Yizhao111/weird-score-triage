@@ -1244,6 +1244,7 @@ def generate_step3_tables(benchmark):
         verifier_text = verifier_stdout.read_text() if verifier_stdout.exists() else ""
         exc_text = exception_txt.read_text() if exception_txt.exists() else ""
         low_exc = exc_text.lower()
+        low_verifier = verifier_text.lower()
 
         real_rl = any(
             token in (low_exc + verifier_text.lower())
@@ -1300,6 +1301,8 @@ def generate_step3_tables(benchmark):
                 "exception_type": exception_type,
                 "category": category,
                 "patterns": patterns,
+                "exc_text": exc_text,
+                "verifier_text": verifier_text,
                 "has_trajectory": trajectory_path.exists(),
                 "has_verifier_stdout": verifier_stdout.exists(),
                 "trajectory_path": str(trajectory_path) if trajectory_path.exists() else "",
@@ -1321,6 +1324,90 @@ def generate_step3_tables(benchmark):
     ok_rows = []
     ec_rows = []
     mf_rows = []
+    rerun_rows = []
+
+    reasoning_map = {}
+    reasoning_path = out_dir / "reasoning.tsv"
+    if reasoning_path.exists():
+        with reasoning_path.open(newline="") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                reasoning_map[(row.get("task", ""), row.get("agent", ""), row.get("model", ""))] = {
+                    "reasoning": (row.get("reasoning") or "").strip(),
+                    "rerun_recommendation": (row.get("rerun_recommendation") or "").strip().lower(),
+                    "rerun_justification": (row.get("rerun_justification") or "").strip(),
+                }
+
+    def classify_rerun(cell_trials, ok_runs, n_trials):
+        if ok_runs >= n_trials:
+            return None
+
+        exc_counts = Counter(trial["exception_type"] for trial in cell_trials)
+        categories = Counter(trial["category"] for trial in cell_trials)
+        combined_text = "\n".join(
+            (trial.get("exc_text") or "") + "\n" + (trial.get("verifier_text") or "") for trial in cell_trials
+        ).lower()
+        policy_terms = [
+            "policy violation",
+            "content policy",
+            "safety policy",
+            "refused",
+            "refusal",
+            "blocked by policy",
+            "disallowed content",
+        ]
+        has_policy_signal = any(term in combined_text for term in policy_terms)
+
+        yes_count = (
+            categories.get("real_rate_limit", 0)
+            + exc_counts.get("CancelledError", 0)
+            + exc_counts.get("DaytonaError", 0)
+            + exc_counts.get("DaytonaNotFoundError", 0)
+            + exc_counts.get("DaytonaRateLimitError", 0)
+            + exc_counts.get("RateLimitError", 0)
+        )
+        no_count = (
+            exc_counts.get("RewardFileNotFoundError", 0)
+            + exc_counts.get("AgentTimeoutError", 0)
+            + exc_counts.get("VerifierTimeoutError", 0)
+        )
+        nonzero_count = exc_counts.get("NonZeroAgentExitCodeError", 0)
+
+        if yes_count > 0:
+            return (
+                "yes",
+                f"Infra or quota-like failures appeared in {yes_count}/{n_trials} trial(s), which is a valid rerun pattern.",
+            )
+        if nonzero_count > 0 and not has_policy_signal and no_count == 0:
+            return (
+                "yes",
+                f"NonZeroAgentExitCodeError appeared in {nonzero_count}/{n_trials} trial(s) with no policy-violation signal, so this cell looks rerunnable.",
+            )
+        if nonzero_count > 0 and not has_policy_signal:
+            return (
+                "maybe",
+                f"NonZeroAgentExitCodeError appeared in {nonzero_count}/{n_trials} trial(s), but the cell also has non-rerun failure patterns.",
+            )
+        if nonzero_count > 0 and has_policy_signal:
+            return (
+                "no",
+                "NonZeroAgentExitCodeError is present, but the logs also suggest refusal or policy-related blocking rather than infra failure.",
+            )
+        if no_count > 0:
+            dominant = []
+            if exc_counts.get("RewardFileNotFoundError", 0):
+                dominant.append("RewardFileNotFoundError")
+            if exc_counts.get("AgentTimeoutError", 0):
+                dominant.append("AgentTimeoutError")
+            if exc_counts.get("VerifierTimeoutError", 0):
+                dominant.append("VerifierTimeoutError")
+            return (
+                "no",
+                f"{', '.join(dominant)} drives this cell, which usually reflects stable task/model behavior rather than a rerunnable infra issue.",
+            )
+        return (
+            "maybe",
+            "The cell has non-OK trials, but the failure pattern is mixed and does not cleanly match the default rerun or non-rerun buckets.",
+        )
 
     for (task, model, agent), cell_trials in sorted(cells.items()):
         rewards = [trial["reward"] for trial in cell_trials if trial["reward"] is not None]
@@ -1392,6 +1479,36 @@ def generate_step3_tables(benchmark):
             }
         )
 
+        rerun = classify_rerun(
+            cell_trials,
+            ok_runs=sum(1 for trial in cell_trials if trial["exception_type"] == "OK"),
+            n_trials=len(cell_trials),
+        )
+        if rerun:
+            heuristic_recommendation, heuristic_reason = rerun
+            reasoning_row = reasoning_map.get((task, agent, model), {})
+            subagent_recommendation = reasoning_row.get("rerun_recommendation", "")
+            subagent_justification = reasoning_row.get("rerun_justification", "")
+            final_recommendation = subagent_recommendation or heuristic_recommendation
+            reason_parts = []
+            if subagent_justification:
+                reason_parts.append(f"Subagent: {subagent_justification}")
+            if heuristic_reason:
+                reason_parts.append(f"Heuristic: {heuristic_reason}")
+            rerun_rows.append(
+                {
+                    "task": task,
+                    "agent": agent,
+                    "model": model,
+                    "heuristic_rerun_recommendation": heuristic_recommendation,
+                    "heuristic_rerun_reason": heuristic_reason.strip(),
+                    "subagent_rerun_recommendation": subagent_recommendation,
+                    "subagent_rerun_justification": subagent_justification,
+                    "rerun_recommendation": final_recommendation,
+                    "rerun_reason": " ".join(part for part in reason_parts if part).strip(),
+                }
+            )
+
     with (out_dir / "ok_runs.tsv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(ok_rows[0].keys()), delimiter="\t")
         writer.writeheader()
@@ -1412,6 +1529,57 @@ def generate_step3_tables(benchmark):
         writer.writeheader()
         writer.writerows(mf_rows)
 
+    rerun_json = {
+        "cells_reviewed": len(rerun_rows),
+        "rerun_yes": sum(1 for row in rerun_rows if row["rerun_recommendation"] == "yes"),
+        "rerun_maybe": sum(1 for row in rerun_rows if row["rerun_recommendation"] == "maybe"),
+        "rerun_no": sum(1 for row in rerun_rows if row["rerun_recommendation"] == "no"),
+        "subagent_rows": sum(1 for row in rerun_rows if row["subagent_rerun_recommendation"]),
+        "subagent_overrides": sum(
+            1
+            for row in rerun_rows
+            if row["subagent_rerun_recommendation"]
+            and row["subagent_rerun_recommendation"] != row["heuristic_rerun_recommendation"]
+        ),
+    }
+    yes_examples = [row for row in rerun_rows if row["rerun_recommendation"] == "yes"][:3]
+    no_examples = [row for row in rerun_rows if row["rerun_recommendation"] == "no"][:3]
+    summary_lines = [
+        f"Reviewed {rerun_json['cells_reviewed']} orange cells for rerun suitability.",
+        f"Recommended rerun for {rerun_json['rerun_yes']} cell(s), marked {rerun_json['rerun_maybe']} as maybe, and {rerun_json['rerun_no']} as no.",
+        f"Final labels prefer subagent rerun judgments when present and otherwise fall back to the heuristic pass; subagent coverage was {rerun_json['subagent_rows']} cells with {rerun_json['subagent_overrides']} override(s).",
+        "Valid rerun patterns are quota, Daytona/platform, cancellation, and selected NonZeroAgentExitCodeError cases without policy signals.",
+        "RewardFileNotFoundError and AgentTimeoutError are usually treated as non-rerun patterns unless contradictory infra evidence appears.",
+    ]
+    if yes_examples:
+        sample = ", ".join(f"{row['task']} {row['model']}/{row['agent']}" for row in yes_examples)
+        summary_lines.append(f"Representative rerun candidates: {sample}.")
+    if no_examples:
+        sample = ", ".join(f"{row['task']} {row['model']}/{row['agent']}" for row in no_examples)
+        summary_lines.append(f"Representative non-rerun cells: {sample}.")
+    rerun_json["summary"] = " ".join(summary_lines[:6])
+
+    with (out_dir / "rerun_summary.tsv").open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "task",
+                "agent",
+                "model",
+                "heuristic_rerun_recommendation",
+                "heuristic_rerun_reason",
+                "subagent_rerun_recommendation",
+                "subagent_rerun_justification",
+                "rerun_recommendation",
+                "rerun_reason",
+            ],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerows(rerun_rows)
+
+    (out_dir / "rerun_summary.json").write_text(json.dumps(rerun_json, indent=2))
+
     return out_dir
 
 
@@ -1423,13 +1591,17 @@ def render_step3_html(benchmark, html_path):
     error_type_rows = step3.read_tsv(tables_dir / "error_types.tsv")
     missing_rows = step3.read_tsv(tables_dir / "missing_extracted_files.tsv")
     reasoning_rows = step3.read_optional_tsv(tables_dir / "reasoning.tsv")
-    combined_rows = step3.build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows)
+    rerun_rows = step3.read_optional_tsv(tables_dir / "rerun_summary.tsv")
+    rerun_summary = step3.read_optional_json(tables_dir / "rerun_summary.json")
+    combined_rows = step3.build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows, rerun_rows)
     data = {
         "ok_rows": ok_rows,
         "error_category_rows": error_category_rows,
         "error_type_rows": error_type_rows,
         "missing_rows": missing_rows,
         "reasoning_rows": reasoning_rows,
+        "rerun_rows": rerun_rows,
+        "rerun_summary": rerun_summary,
         "combined_rows": combined_rows,
         "summary": step3.build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows),
     }

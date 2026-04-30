@@ -38,6 +38,13 @@ def read_optional_tsv(path: Path) -> list[dict[str, str]]:
     return read_tsv(path)
 
 
+def read_optional_json(path: Path):
+    if not path.exists():
+        return {}
+    with path.open() as f:
+        return json.load(f)
+
+
 def canonical_output_path(benchmark: str, output: Path, date_str: str) -> Path:
     return output.parent / f"{benchmark}-step3-report-{date_str}.html"
 
@@ -63,7 +70,7 @@ def build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows):
     }
 
 
-def build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows):
+def build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows, rerun_rows):
     ok_index = {
         (row["task"], row["agent"], row["model"]): row
         for row in ok_rows
@@ -76,17 +83,22 @@ def build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_ro
         (row["task"], row["agent"], row["model"]): row
         for row in reasoning_rows
     }
+    rerun_index = {
+        (row["task"], row["agent"], row["model"]): row
+        for row in rerun_rows
+    }
     category_index = {}
     for row in error_category_rows:
         key = (row["task"], row["agent"], row["model"])
         category_index.setdefault(key, []).append(row)
 
     combined_rows = []
-    all_keys = sorted(set(ok_index) | set(category_index) | set(missing_index) | set(reasoning_index))
+    all_keys = sorted(set(ok_index) | set(category_index) | set(missing_index) | set(reasoning_index) | set(rerun_index))
     for key in all_keys:
         ok_row = ok_index.get(key, {})
         missing_row = missing_index.get(key, {})
         reasoning_row = reasoning_index.get(key, {})
+        rerun_row = rerun_index.get(key, {})
         categories = category_index.get(key, [])
         base = {
             "task": key[0],
@@ -108,6 +120,8 @@ def build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_ro
             "verifier_test_stdout_path": missing_row.get("verifier_test_stdout_path", ""),
             "trajectory_last_step": missing_row.get("trajectory_last_step", ""),
             "reasoning": reasoning_row.get("reasoning", ""),
+            "rerun_recommendation": reasoning_row.get("rerun_recommendation") or rerun_row.get("rerun_recommendation", ""),
+            "rerun_reason": reasoning_row.get("rerun_justification") or rerun_row.get("rerun_reason", ""),
         }
         error_categories = " | ".join(
             row["error_category"] for row in categories if row.get("error_category")
@@ -219,6 +233,99 @@ h1 {{
   margin: 0 0 10px;
   color: var(--muted);
   font-size: 13px;
+}
+.rerun-panel.hidden {{
+  display: none;
+}}
+.rerun-summary {{
+  margin: 0 0 16px;
+}}
+.rerun-metrics {{
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}}
+.rerun-metric {{
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fcfcfd;
+}}
+.rerun-metric b {{
+  display: block;
+  font-size: 24px;
+}}
+.rerun-metric span {{
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}}
+.rerun-panel.hidden {{
+  display: none;
+}}
+.rerun-summary {{
+  margin: 0 0 16px;
+}}
+.rerun-metrics {{
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}}
+.rerun-metric {{
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fcfcfd;
+}}
+.rerun-metric b {{
+  display: block;
+  font-size: 24px;
+}}
+.rerun-metric span {{
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}}
+.insight-sections {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.insight-section {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  overflow: hidden;
+}
+.insight-section h3 {
+  margin: 0;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: #f8fafc;
+  font-size: 15px;
+}
+.insight-empty {
+  padding: 14px;
+  color: var(--muted);
+}
+.insight-body {
+  padding: 14px;
+}
+.insight-metric {
+  display: block;
+  margin-bottom: 10px;
+  color: var(--blue);
+  font-size: 28px;
+  font-weight: 700;
+}
+.insight-list {
+  margin: 0;
+  padding-left: 18px;
+}
+.insight-list li {
+  margin-bottom: 8px;
 }
 .tabs {{
   display: flex;
@@ -424,6 +531,7 @@ tr:last-child td {{ border-bottom: 0; }}
 
   <div class="tabs">
     <button class="tab active" data-tab="rerun">Re-run analysis</button>
+    <button class="tab" data-tab="accuracy-insight">Accuracy & Insight</button>
     <button class="tab" data-tab="high-difficulty">High Difficulty</button>
   </div>
 
@@ -442,6 +550,17 @@ tr:last-child td {{ border-bottom: 0; }}
     </select>
   </div>
 
+  <div id="rerun-summary-panel" class="panel rerun-panel hidden">
+    <h2>Re-run Summary</h2>
+    <p id="rerun-summary-text" class="chart-caption"></p>
+    <div class="rerun-metrics">
+      <div class="rerun-metric"><b id="rerun-reviewed"></b><span>Orange Cells Reviewed</span></div>
+      <div class="rerun-metric"><b id="rerun-yes"></b><span>Re-run Yes</span></div>
+      <div class="rerun-metric"><b id="rerun-maybe"></b><span>Re-run Maybe</span></div>
+      <div class="rerun-metric"><b id="rerun-no"></b><span>Re-run No</span></div>
+    </div>
+  </div>
+
   <div id="difficulty-chart-panel" class="panel chart-panel hidden">
     <h2>High Difficulty Chart</h2>
     <p class="chart-caption">Ranked horizontal bar chart of task-level difficulty scores. `difficulty_score = 0.40 * low_reward_signal + 0.20 * low_ok_signal + 0.15 * failure_mix_signal + 0.15 * frontier_struggle_signal + 0.10 * variance_signal`.</p>
@@ -449,6 +568,8 @@ tr:last-child td {{ border-bottom: 0; }}
       <svg id="difficulty-chart" role="img" aria-label="High difficulty ranked bar chart"></svg>
     </div>
   </div>
+
+  <div id="accuracy-insight-panel" class="insight-sections hidden"></div>
 
   <div class="table-wrap">
     <table>
@@ -461,6 +582,138 @@ tr:last-child td {{ border-bottom: 0; }}
 <script id="report-data" type="application/json">__DATA__</script>
 <script>
 const DATA = JSON.parse(document.getElementById("report-data").textContent);
+const MODEL_TIERS = {
+  "gpt-5.4": 3,
+  "gpt-5-mini": 2,
+  "gpt-5-nano": 1,
+  "claude-opus-4-6": 3,
+  "claude-sonnet-4-6": 2,
+  "claude-haiku-4-5-20251001": 1,
+  "gemini-3.1-pro-preview": 2,
+  "gemini-3-flash-preview": 1,
+};
+const AGENT_TIERS = {
+  "codex": 3,
+  "claude-code": 3,
+  "gemini-cli": 2,
+  "terminus-2": 1,
+};
+const FRONTIER_MODELS = {
+  "openai": "gpt-5.4",
+  "anthropic": "claude-opus-4-6",
+  "google": "gemini-3.1-pro-preview",
+};
+const NATIVE_AGENT = { "gpt": "codex", "claude": "claude-code", "gemini": "gemini-cli" };
+
+function modelFamily(model) {
+  const value = String(model || "");
+  if (value.startsWith("gpt")) return "openai";
+  if (value.startsWith("claude")) return "anthropic";
+  if (value.startsWith("gemini")) return "google";
+  return "";
+}
+
+function strongerModel(a, b) {
+  return modelFamily(a) && modelFamily(a) === modelFamily(b) && Number(MODEL_TIERS[a] || 0) > Number(MODEL_TIERS[b] || 0);
+}
+
+function strongerAgent(a, b) {
+  return Number(AGENT_TIERS[a] || 0) > Number(AGENT_TIERS[b] || 0);
+}
+
+function nativeAgent(model) {
+  const value = String(model || "");
+  if (value.startsWith("gpt")) return NATIVE_AGENT.gpt;
+  if (value.startsWith("claude")) return NATIVE_AGENT.claude;
+  if (value.startsWith("gemini")) return NATIVE_AGENT.gemini;
+  return "";
+}
+
+function buildAccuracyInsightSummary(rows) {
+  const grouped = new Map();
+  rows.forEach(function (row) {
+    const score = Number(row.reward_mean);
+    if (!Number.isFinite(score)) return;
+    const key = `${row.model}@@${row.agent}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(score);
+  });
+  const benchData = new Map();
+  grouped.forEach(function (scores, key) {
+    const mean = scores.reduce(function (acc, value) { return acc + value; }, 0) / scores.length;
+    benchData.set(key, mean);
+  });
+  const models = Array.from(new Set(rows.map(function (row) { return row.model; }))).sort();
+  const agents = Array.from(new Set(rows.map(function (row) { return row.agent; }))).sort();
+  const sections = {
+    "Model Inversions": [],
+    "Agent Inversions": [],
+    "Native Agent Underperformance": [],
+    "Cross-Family Surprises": [],
+  };
+
+  agents.forEach(function (agent) {
+    models.forEach(function (stronger) {
+      models.forEach(function (weaker) {
+        if (!strongerModel(stronger, weaker)) return;
+        const strongScore = benchData.get(`${stronger}@@${agent}`);
+        const weakScore = benchData.get(`${weaker}@@${agent}`);
+        if (!Number.isFinite(strongScore) || !Number.isFinite(weakScore) || strongScore >= weakScore - 0.05) return;
+        sections["Model Inversions"].push(`${stronger}/${agent}=${strongScore.toFixed(3)} is below ${weaker}/${agent}=${weakScore.toFixed(3)}.`);
+      });
+    });
+  });
+
+  models.forEach(function (model) {
+    agents.forEach(function (stronger) {
+      agents.forEach(function (weaker) {
+        if (!strongerAgent(stronger, weaker)) return;
+        const strongScore = benchData.get(`${model}@@${stronger}`);
+        const weakScore = benchData.get(`${model}@@${weaker}`);
+        if (!Number.isFinite(strongScore) || !Number.isFinite(weakScore) || strongScore >= weakScore - 0.05) return;
+        sections["Agent Inversions"].push(`${model}/${stronger}=${strongScore.toFixed(3)} is below ${model}/${weaker}=${weakScore.toFixed(3)}.`);
+      });
+    });
+  });
+
+  models.forEach(function (model) {
+    const native = nativeAgent(model);
+    if (!native) return;
+    const nativeScore = benchData.get(`${model}@@${native}`);
+    if (!Number.isFinite(nativeScore)) return;
+    agents.forEach(function (otherAgent) {
+      if (otherAgent === native) return;
+      const otherScore = benchData.get(`${model}@@${otherAgent}`);
+      if (!Number.isFinite(otherScore) || otherScore <= nativeScore + 0.10) return;
+      sections["Native Agent Underperformance"].push(`${model}/${native}=${nativeScore.toFixed(3)} is below ${model}/${otherAgent}=${otherScore.toFixed(3)}.`);
+    });
+  });
+
+  const frontierBest = {};
+  Object.entries(FRONTIER_MODELS).forEach(function ([family, model]) {
+    let best = -Infinity;
+    agents.forEach(function (agent) {
+      const score = benchData.get(`${model}@@${agent}`);
+      if (Number.isFinite(score)) best = Math.max(best, score);
+    });
+    if (best > -Infinity) frontierBest[family] = { model: model, score: best };
+  });
+  models.forEach(function (model) {
+    const family = modelFamily(model);
+    if (!family || Number(MODEL_TIERS[model] || 99) > 1) return;
+    agents.forEach(function (agent) {
+      const score = benchData.get(`${model}@@${agent}`);
+      if (!Number.isFinite(score)) return;
+      Object.entries(frontierBest).forEach(function ([frontierFamily, info]) {
+        if (frontierFamily === family || score <= info.score + 0.15) return;
+        sections["Cross-Family Surprises"].push(`${model}/${agent}=${score.toFixed(3)} exceeds ${info.model} best=${info.score.toFixed(3)}.`);
+      });
+    });
+  });
+
+  return sections;
+}
+const ACCURACY_INSIGHT_SUMMARY = buildAccuracyInsightSummary(DATA.combined_rows);
 
 const tabDefs = {{
   rerun: {{
@@ -471,6 +724,8 @@ const tabDefs = {{
       "model",
       "n_trials",
       "exception_summary",
+      "rerun_recommendation",
+      "rerun_reason",
       "reward_mean",
       "reward_std",
       "reasoning",
@@ -479,6 +734,10 @@ const tabDefs = {{
       "error_category",
       "matched_patterns"
     ],
+  }},
+  "accuracy-insight": {{
+    rows: DATA.combined_rows,
+    columns: [],
   }},
   "high-difficulty": {{
     rows: DATA.combined_rows,
@@ -514,6 +773,30 @@ function fillSummary() {{
   missing.innerHTML = Object.entries(DATA.summary.missing_totals).map(([name, count]) => `<li><span class="mono">${{name}}</span>: ${{count}}</li>`).join("");
 }}
 
+function fillRerunSummary() {{
+  const rows = Array.isArray(DATA.rerun_rows) ? DATA.rerun_rows : [];
+  const summary = DATA.rerun_summary && typeof DATA.rerun_summary === "object" ? DATA.rerun_summary : {{}};
+  const fallback = {{
+    cells_reviewed: rows.length,
+    rerun_yes: rows.filter(function (row) {{ return row.rerun_recommendation === "yes"; }}).length,
+    rerun_maybe: rows.filter(function (row) {{ return row.rerun_recommendation === "maybe"; }}).length,
+    rerun_no: rows.filter(function (row) {{ return row.rerun_recommendation === "no"; }}).length,
+    subagent_rows: rows.filter(function (row) {{ return safeCell(row.subagent_rerun_recommendation); }}).length,
+    subagent_overrides: rows.filter(function (row) {{
+      return safeCell(row.subagent_rerun_recommendation)
+        && safeCell(row.subagent_rerun_recommendation) !== safeCell(row.heuristic_rerun_recommendation);
+    }}).length,
+  }};
+  const merged = Object.assign({{}}, fallback, summary);
+  const summaryText = merged.summary
+    || `Reviewed ${merged.cells_reviewed || 0} orange cells. Final rerun labels prefer subagent judgments when present and otherwise fall back to the heuristic pass.`;
+  document.getElementById("rerun-summary-text").textContent = summaryText;
+  document.getElementById("rerun-reviewed").textContent = merged.cells_reviewed || 0;
+  document.getElementById("rerun-yes").textContent = merged.rerun_yes || 0;
+  document.getElementById("rerun-maybe").textContent = merged.rerun_maybe || 0;
+  document.getElementById("rerun-no").textContent = merged.rerun_no || 0;
+}}
+
 function fillFilters() {{
   const rows = Object.values(tabDefs).flatMap(def => def.rows);
   for (const [id, key] of [["task-filter","task"], ["agent-filter","agent"], ["model-filter","model"]]) {{
@@ -541,10 +824,19 @@ function applyTabControlVisibility() {{
   const orangeOnly = document.getElementById("orange-only");
   const difficultyBand = document.getElementById("difficulty-band");
   const chartPanel = document.getElementById("difficulty-chart-panel");
+  const insightPanel = document.getElementById("accuracy-insight-panel");
+  const rerunPanel = document.getElementById("rerun-summary-panel");
   const isHighDifficulty = currentTab === "high-difficulty";
+  const isAccuracyInsight = currentTab === "accuracy-insight";
+  const isRerun = currentTab === "rerun";
   orangeOnly.classList.toggle("hidden", isHighDifficulty);
   difficultyBand.classList.toggle("hidden", !isHighDifficulty);
   chartPanel.classList.toggle("hidden", !isHighDifficulty);
+  insightPanel.classList.toggle("hidden", !isAccuracyInsight);
+  rerunPanel.classList.toggle("hidden", !isRerun);
+  if (currentTab !== "rerun") {
+    orangeOnly.classList.add("hidden");
+  }
 }
 
 function isMissingRow(row) {{
@@ -930,6 +1222,31 @@ function renderDifficultyChart(items, thresholds) {{
   svg.innerHTML = gridLines + bars;
 }
 
+function renderAccuracyInsightSections() {
+  const panel = document.getElementById("accuracy-insight-panel");
+  const sections = [
+    ["Model Inversions", ACCURACY_INSIGHT_SUMMARY["Model Inversions"] || []],
+    ["Agent Inversions", ACCURACY_INSIGHT_SUMMARY["Agent Inversions"] || []],
+    ["Native Agent Underperformance", ACCURACY_INSIGHT_SUMMARY["Native Agent Underperformance"] || []],
+    ["Cross-Family Surprises", ACCURACY_INSIGHT_SUMMARY["Cross-Family Surprises"] || []],
+  ];
+  panel.innerHTML = sections.map(function ([title, subset]) {
+    if (!subset.length) {
+      return `<section class="insight-section"><h3>${title}</h3><div class="insight-body"><span class="insight-metric">0</span><div class="insight-empty">No benchmark-level examples under the current aggregate checks.</div></div></section>`;
+    }
+    const items = subset.slice(0, 5).map(function (text) {
+      return `<li>${escapeHtml(text)}</li>`;
+    }).join("");
+    return `<section class="insight-section">`
+      + `<h3>${title}</h3>`
+      + `<div class="insight-body">`
+      + `<span class="insight-metric">${subset.length}</span>`
+      + `<ul class="insight-list">${items}</ul>`
+      + `</div>`
+      + `</section>`;
+  }).join("");
+}
+
 function bindHeadClicks() {{
   document.querySelectorAll("#head-row th[data-col]").forEach(function (th) {{
     th.addEventListener("click", function () {{
@@ -952,6 +1269,12 @@ function renderTable() {{
   const wrap = document.querySelector(".table-wrap");
   wrap.dataset.tab = currentTab;
   applyTabControlVisibility();
+  if (currentTab === "accuracy-insight") {
+    wrap.classList.add("hidden");
+    renderAccuracyInsightSections();
+    return;
+  }
+  wrap.classList.remove("hidden");
   if (currentTab === "high-difficulty") {{
     if (!sortState.key) {{
       sortState.key = "difficulty_score";
@@ -1058,6 +1381,7 @@ document.getElementById("orange-only").addEventListener("click", function () {{
 }});
 
 fillSummary();
+fillRerunSummary();
 fillFilters();
 renderTable();
 </script>
@@ -1078,7 +1402,9 @@ def main() -> None:
     error_type_rows = read_tsv(args.tables_dir / "error_types.tsv")
     missing_rows = read_tsv(args.tables_dir / "missing_extracted_files.tsv")
     reasoning_rows = read_optional_tsv(args.tables_dir / "reasoning.tsv")
-    combined_rows = build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows)
+    rerun_rows = read_optional_tsv(args.tables_dir / "rerun_summary.tsv")
+    rerun_summary = read_optional_json(args.tables_dir / "rerun_summary.json")
+    combined_rows = build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows, rerun_rows)
 
     data = {
         "ok_rows": ok_rows,
@@ -1086,6 +1412,8 @@ def main() -> None:
         "error_type_rows": error_type_rows,
         "missing_rows": missing_rows,
         "reasoning_rows": reasoning_rows,
+        "rerun_rows": rerun_rows,
+        "rerun_summary": rerun_summary,
         "combined_rows": combined_rows,
         "summary": build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows),
     }
