@@ -65,7 +65,7 @@ If either clone fails, report it and note which steps will be skipped — the an
 
 This repository has one audit generators:
 
-- `generate_leaderboard_task_audit.py` — the focused benchmark/task audit. Use this for single-benchmark reports, score-aggregation diagnostics, and downloaded trial archive analysis.
+- `generate_leaderboard_task_audit.py` — the focused benchmark/task audit. Use this for single-benchmark reports, score-aggregation diagnostics, and downloaded trial archive analysis. For a focused benchmark with extracted trials under `/tmp/<benchmark>/`, its `.html` output should be the Step 3 interactive report style, not the benchmark-card audit template.
 
 For the focused task audit, prepare both leaderboard RPC files and then run the task generator with the benchmark name:
 
@@ -73,7 +73,12 @@ For the focused task audit, prepare both leaderboard RPC files and then run the 
 python3 generate_leaderboard_task_audit.py <benchmark>
 ```
 
-The task generator writes artifacts named `leaderboard-task-audit[-<benchmark>]-<timestamp>.json`, `.md`, and `.html` under `~/harbor-audits/`. When a benchmark argument is provided, the HTML is rendered as a single-benchmark report and the benchmark card is expanded by default.
+The task generator writes artifacts named `leaderboard-task-audit[-<benchmark>]-<timestamp>.json`, `.md`, and `.html` under `~/harbor-audits/`.
+
+For focused benchmark runs:
+- `.json` and `.md` remain the leaderboard task-audit summary artifacts.
+- `.html` is expected to use the Step 3 interactive layout when extracted trials are available under `/tmp/<benchmark>/`.
+- Do not treat the benchmark-card audit HTML as the final deliverable for single-benchmark triage when the Step 3 inputs exist.
 
 The task generator filters out benchmark families that should not be audited in this workflow before processing:
 - `deveval`
@@ -599,7 +604,48 @@ print(f"Tables written to: {OUT_DIR}")
 PYEOF
 ```
 
-### Step 3c — Render the HTML report
+### Step 3c — Use a subagent to explain each orange row
+
+After generating the Step 3 tables, use subagents to inspect the extracted files for each orange-highlighted merged-table row and write a compact explanation artifact for the HTML.
+
+**When a row is orange**
+- A row is orange when it is not an all-OK cell, meaning it does not have an all-success exception summary such as `OK:5`.
+- These are the rows where reviewers benefit from a short explanation before opening raw logs.
+
+**What the subagent should inspect**
+- `exception.txt` when present
+- `agent/trajectory.json` when present, or the fact that it is missing
+- `verifier/test-stdout.txt` when present
+- `verifier/reward.txt` when present
+- `trial.log` when present
+
+**Output contract**
+- Write `/tmp/<benchmark>_step3_tables/reasoning.tsv`
+- Columns: `task`, `agent`, `model`, `reasoning`
+- `reasoning` must be evidence-based and no more than 4 sentences
+- Mention the dominant exception or missing-file pattern, whether the agent appears to have started, and whether the verifier appears to have run
+
+**Subagent fan-out requirement**
+- Split the orange rows across **4 subagents**.
+- If the orchestrator is **Codex**, use **`gpt-5.4-mini`** for the 4 subagents.
+- If the orchestrator is **Claude Code**, use **Claude 4.5 Haiku** for the 4 subagents.
+- Assign each subagent a disjoint slice of orange rows so ownership is clear and the outputs can be merged without collisions.
+- Merge the 8 partial outputs into a single `/tmp/<benchmark>_step3_tables/reasoning.tsv` keyed by `task`, `agent`, and `model`.
+
+**Rationale**
+- Orange rows are triage rows, not final diagnoses. The report needs one compact, local explanation per flagged cell so a reviewer can decide whether to drill into raw files.
+- Subagents are a good fit because each `(task, agent, model)` cell is independent, the evidence lives in a small file set, and the work parallelizes well across flagged rows.
+- Eight workers is a practical default for this step: it gives meaningful concurrency across orange rows without making the merge process or prompt coordination fragile.
+- The 4-sentence limit forces the output to stay diagnostic and evidence-based rather than drifting into long summaries or speculation.
+- A keyed TSV keeps the HTML deterministic: the renderer simply joins `reasoning.tsv` by `task/agent/model` and displays the result as a new column.
+
+**Suggested Codex prompt**
+
+```text
+Analyze the assigned orange-highlighted Step 3 rows for <benchmark>. For each assigned (task, agent, model) cell that is not all-OK, inspect exception.txt, agent/trajectory.json, and verifier/test-stdout.txt under /tmp/<benchmark>/. Write a partial TSV with columns task, agent, model, reasoning. Each reasoning must be evidence-based, no more than 4 sentences, and explain why the row is flagged.
+```
+
+### Step 3d — Render the HTML report
 
 ```bash
 BENCHMARK="<benchmark>"
@@ -616,11 +662,15 @@ Open the report:
 file:///Users/han/harbor-audits/<benchmark>-step3-<datetime>.html
 ```
 
-The report has two interactive tabs:
-- **Missing Extracted Files** (default) — per-cell counts of missing `trajectory.json` and `test-stdout.txt`, `reward_mean`/`reward_std` with outliers highlighted, and clickable file paths to open each trajectory or verifier log directly.
-- **Run Summary** — merged ok_runs + error_categories with search and filter controls.
+This Step 3-style HTML is the intended final deliverable for focused benchmark triage. If `generate_leaderboard_task_audit.py <benchmark>` is used after extraction, its emitted `leaderboard-task-audit-<benchmark>-<timestamp>.html` should match this Step 3 layout rather than the benchmark-card audit layout.
 
-The top summary panels show **Top Error Categories**, **Top Error Types**, and **Missing Extracted Files** totals. All tabs support free-text search and per-column filtering by task, agent, and model.
+The report now renders a single merged table with:
+- per-cell `task`, `agent`, `model`, `n_trials`, exception summary, `reward_mean`, and `reward_std`
+- clickable `trajectory_json_path` and `verifier_test_stdout_path`
+- merged `error_category` and `matched_patterns`
+- optional subagent-produced `reasoning`
+
+The top summary panels show **Top Error Categories**, **Top Error Types**, and **Missing Extracted Files** totals. The table supports free-text search, dropdown filters for task/agent/model, and an `Only orange rows` toggle button. If `/tmp/<benchmark>_step3_tables/reasoning.tsv` exists, the HTML joins it automatically and shows a `reasoning` column.
 
 > **Note on `error_types.tsv`:** The script writes one row per trial (not one row per distinct type) so that `build_summary`'s `Counter` produces correct counts. Do not collapse this file to one row per type.
 

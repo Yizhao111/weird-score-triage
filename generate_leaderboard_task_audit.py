@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import csv
+import importlib.util
 import json
+import math
 import os
 import re
+import statistics
 import sys
 import tarfile
 from collections import Counter, defaultdict
@@ -16,7 +19,7 @@ LEADERBOARD_AGG_JSON = Path("/tmp/leaderboard_aggregate.json")
 TRIAL_ARCHIVE_ROOT = Path("/tmp/harbor-cell-trials")
 HARBOR_ADAPTERS = Path("/tmp/harbor/adapters")
 MIX_JOBS = Path("/tmp/harbor-mix/benchmark_info_jobs")
-TEMPLATE = ROOT / "templates" / "leaderboard-task-audit-interactive.html"
+STEP3_RENDERER = ROOT / "scripts" / "generate_step3_html_report.py"
 OWNERS = ROOT / "experiment-track.csv"
 OUT_DIR = Path.home() / "harbor-audits"
 
@@ -52,6 +55,10 @@ ROOT_CAUSES = [
     "Model Behavior Issue",
     "Needs More Investigation",
 ]
+CONFIDENCE_Z = 1.96
+MIN_INVERSION_GAP = 0.05
+BOUNDED_SCORE_FLOOR = 0.05
+RELATIVE_SEM_THRESHOLD = 0.35
 
 
 def norm(value):
@@ -79,6 +86,72 @@ def canon(value):
 def load_json(path):
     with open(path) as f:
         return json.load(f)
+
+
+def quantile(values, q):
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * q
+    lower = int(math.floor(pos))
+    upper = int(math.ceil(pos))
+    if lower == upper:
+        return ordered[lower]
+    frac = pos - lower
+    return ordered[lower] * (1 - frac) + ordered[upper] * frac
+
+
+def iqr(values):
+    q1 = quantile(values, 0.25)
+    q3 = quantile(values, 0.75)
+    if q1 is None or q3 is None:
+        return 0.0
+    return max(0.0, q3 - q1)
+
+
+def sample_stats(values):
+    if not values:
+        return {"mean": None, "std": None, "sem": None, "ci95_half": None, "n": 0}
+    mean = statistics.mean(values)
+    std = statistics.stdev(values) if len(values) >= 2 else 0.0
+    sem = std / math.sqrt(len(values)) if len(values) >= 2 else 0.0
+    return {
+        "mean": mean,
+        "std": std,
+        "sem": sem,
+        "ci95_half": CONFIDENCE_Z * sem,
+        "n": len(values),
+    }
+
+
+def scale_floor(mean_value, bounded):
+    if bounded:
+        return BOUNDED_SCORE_FLOOR
+    baseline = abs(mean_value) * 0.1 if mean_value is not None else 0.0
+    return max(baseline, 0.05)
+
+
+def sem_ratio(sem_value, mean_value, bounded):
+    if sem_value is None:
+        return 0.0
+    denom = max(abs(mean_value or 0.0), scale_floor(mean_value, bounded))
+    return sem_value / denom if denom else 0.0
+
+
+def uncertainty_halfwidth_threshold(values, bounded):
+    if bounded:
+        return 0.10
+    spread = iqr(values)
+    abs_median = quantile([abs(v) for v in values], 0.5) or 0.0
+    return max(spread * 0.25, abs_median * 0.10, 0.05)
+
+
+def pooled_sem(std_a, n_a, std_b, n_b):
+    left = (std_a / math.sqrt(n_a)) if std_a is not None and n_a and n_a > 1 else 0.0
+    right = (std_b / math.sqrt(n_b)) if std_b is not None and n_b and n_b > 1 else 0.0
+    return math.sqrt(left * left + right * right)
 
 
 def read_tar_member(tf, suffixes, max_chars=20000):
@@ -1121,6 +1194,249 @@ def build_markdown(report_data):
     return "\n".join(lines)
 
 
+def load_step3_renderer():
+    spec = importlib.util.spec_from_file_location("generate_step3_html_report", STEP3_RENDERER)
+    if not spec or not spec.loader:
+        raise RuntimeError(f"Unable to load Step 3 renderer from {STEP3_RENDERER}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def generate_step3_tables(benchmark):
+    bench_root = Path("/tmp") / benchmark
+    if not bench_root.is_dir():
+        raise FileNotFoundError(f"Extracted trial root not found: {bench_root}")
+
+    out_dir = Path("/tmp") / f"{benchmark}_step3_tables"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    trials = []
+    for trial_dir in sorted(bench_root.glob("*/*/*/*")):
+        if not trial_dir.is_dir():
+            continue
+        parts = trial_dir.relative_to(bench_root).parts
+        if len(parts) != 4:
+            continue
+        task, model, agent, trial_id = parts
+        run_dirs = [d for d in trial_dir.iterdir() if d.is_dir()]
+        if not run_dirs:
+            continue
+        run_dir = run_dirs[0]
+
+        result_path = run_dir / "result.json"
+        verifier_stdout = run_dir / "verifier" / "test-stdout.txt"
+        exception_txt = run_dir / "exception.txt"
+        trajectory_path = run_dir / "agent" / "trajectory.json"
+
+        reward = None
+        exception_type = "OK"
+        if result_path.exists():
+            try:
+                result = json.loads(result_path.read_text())
+                verifier_result = result.get("verifier_result") or {}
+                rewards = verifier_result.get("rewards") or {}
+                reward = rewards.get("reward")
+                exception_type = ((result.get("exception_info") or {}).get("exception_type") or "OK")
+            except Exception:
+                pass
+
+        verifier_text = verifier_stdout.read_text() if verifier_stdout.exists() else ""
+        exc_text = exception_txt.read_text() if exception_txt.exists() else ""
+        low_exc = exc_text.lower()
+
+        real_rl = any(
+            token in (low_exc + verifier_text.lower())
+            for token in ["credit balance is too low", "resource_exhausted", "quota exceeded", "billing"]
+        )
+        if real_rl:
+            category = "real_rate_limit"
+        elif exception_type in ("AgentTimeoutError", "VerifierTimeoutError") or "timed out" in low_exc:
+            category = "timeout"
+        elif exception_type == "RewardFileNotFoundError" or "rewardfilenotfounderror" in low_exc:
+            category = "reward_file_missing"
+        elif exception_type not in ("OK", "", None):
+            category = f"other_exception:{exception_type}"
+        elif reward is not None and reward <= -0.99:
+            category = "floor_score"
+        elif reward is None:
+            category = "no_reward_ok"
+        else:
+            category = "valid_run"
+
+        low_all = (exc_text + verifier_text).lower()
+        patterns = [
+            pattern
+            for pattern in [
+                "agenttimeouterror",
+                "verifiertimeouterror",
+                "rewardfilenotfounderror",
+                "nonzeroagentexitcodeerror",
+                "contextlengthexceedederror",
+                "outputlengthexceedederror",
+                "ratelimiterror",
+                "daytonaerror",
+                "filenotfounderror",
+                "valueerror",
+                "runtimeerror",
+                "importerror",
+                "syntaxerror",
+                "typeerror",
+                "keyerror",
+                "nameerror",
+                "attributeerror",
+                "traceback",
+            ]
+            if pattern in low_all
+        ]
+
+        trials.append(
+            {
+                "task": task,
+                "model": model,
+                "agent": agent,
+                "trial_id": trial_id,
+                "reward": reward,
+                "exception_type": exception_type,
+                "category": category,
+                "patterns": patterns,
+                "has_trajectory": trajectory_path.exists(),
+                "has_verifier_stdout": verifier_stdout.exists(),
+                "trajectory_path": str(trajectory_path) if trajectory_path.exists() else "",
+                "verifier_stdout_path": str(verifier_stdout) if verifier_stdout.exists() else "",
+            }
+        )
+
+    cells = defaultdict(list)
+    for trial in trials:
+        cells[(trial["task"], trial["model"], trial["agent"])].append(trial)
+
+    all_stds = []
+    for cell_trials in cells.values():
+        rewards = [trial["reward"] for trial in cell_trials if trial["reward"] is not None]
+        if len(rewards) >= 2:
+            all_stds.append(statistics.stdev(rewards))
+    p75_std = sorted(all_stds)[int(len(all_stds) * 0.75)] if all_stds else 999
+
+    ok_rows = []
+    ec_rows = []
+    mf_rows = []
+
+    for (task, model, agent), cell_trials in sorted(cells.items()):
+        rewards = [trial["reward"] for trial in cell_trials if trial["reward"] is not None]
+        reward_mean = round(statistics.mean(rewards), 6) if rewards else ""
+        reward_std = round(statistics.stdev(rewards), 6) if len(rewards) >= 2 else ""
+        exc_counts = Counter(trial["exception_type"] for trial in cell_trials)
+        ok_rows.append(
+            {
+                "task": task,
+                "agent": agent,
+                "model": model,
+                "n_trials": len(cell_trials),
+                "ok_runs": sum(1 for trial in cell_trials if trial["exception_type"] == "OK"),
+                "exception_summary": " | ".join(f"{key}:{value}" for key, value in exc_counts.most_common()),
+                "reward_mean": reward_mean,
+                "reward_std": reward_std,
+                "reward_std_large_flag": "yes" if (reward_std != "" and reward_std > p75_std) else "no",
+            }
+        )
+
+        by_cat = defaultdict(list)
+        for trial in cell_trials:
+            if trial["category"] != "valid_run":
+                by_cat[trial["category"]].append(trial)
+        for category, cat_trials in sorted(by_cat.items()):
+            pat_counts = Counter(pattern for trial in cat_trials for pattern in trial["patterns"])
+            ec_rows.append(
+                {
+                    "task": task,
+                    "agent": agent,
+                    "model": model,
+                    "n_trials": len(cell_trials),
+                    "error_category": category,
+                    "matched_patterns": " | ".join(
+                        f"{pattern}:{count}" for pattern, count in pat_counts.most_common(8)
+                    ),
+                }
+            )
+
+        last_steps = []
+        for trial in cell_trials:
+            if trial["trajectory_path"]:
+                try:
+                    trajectory = json.loads(Path(trial["trajectory_path"]).read_text())
+                    steps = trajectory.get("steps", [])
+                    if steps:
+                        last_steps.append(f"{trial['trial_id']}: {json.dumps(steps[-1])}")
+                except Exception:
+                    pass
+        mf_rows.append(
+            {
+                "task": task,
+                "agent": agent,
+                "model": model,
+                "reward_mean": reward_mean,
+                "reward_std": reward_std,
+                "reward_std_large_flag": "yes" if (reward_std != "" and reward_std > p75_std) else "no",
+                "missing_agent_trajectory_json": sum(1 for trial in cell_trials if not trial["has_trajectory"]),
+                "missing_verifier_test_stdout_txt": sum(
+                    1 for trial in cell_trials if not trial["has_verifier_stdout"]
+                ),
+                "trajectory_json_path": " | ".join(
+                    trial["trajectory_path"] for trial in cell_trials if trial["trajectory_path"]
+                ),
+                "verifier_test_stdout_path": " | ".join(
+                    trial["verifier_stdout_path"] for trial in cell_trials if trial["verifier_stdout_path"]
+                ),
+                "trajectory_last_step": " || ".join(last_steps),
+            }
+        )
+
+    with (out_dir / "ok_runs.tsv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(ok_rows[0].keys()), delimiter="\t")
+        writer.writeheader()
+        writer.writerows(ok_rows)
+
+    with (out_dir / "error_categories.tsv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(ec_rows[0].keys()), delimiter="\t")
+        writer.writeheader()
+        writer.writerows(ec_rows)
+
+    with (out_dir / "error_types.tsv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["error_name"], delimiter="\t")
+        writer.writeheader()
+        writer.writerows({"error_name": trial["exception_type"]} for trial in trials)
+
+    with (out_dir / "missing_extracted_files.tsv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(mf_rows[0].keys()), delimiter="\t")
+        writer.writeheader()
+        writer.writerows(mf_rows)
+
+    return out_dir
+
+
+def render_step3_html(benchmark, html_path):
+    tables_dir = generate_step3_tables(benchmark)
+    step3 = load_step3_renderer()
+    ok_rows = step3.read_tsv(tables_dir / "ok_runs.tsv")
+    error_category_rows = step3.read_tsv(tables_dir / "error_categories.tsv")
+    error_type_rows = step3.read_tsv(tables_dir / "error_types.tsv")
+    missing_rows = step3.read_tsv(tables_dir / "missing_extracted_files.tsv")
+    reasoning_rows = step3.read_optional_tsv(tables_dir / "reasoning.tsv")
+    combined_rows = step3.build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows)
+    data = {
+        "ok_rows": ok_rows,
+        "error_category_rows": error_category_rows,
+        "error_type_rows": error_type_rows,
+        "missing_rows": missing_rows,
+        "reasoning_rows": reasoning_rows,
+        "combined_rows": combined_rows,
+        "summary": step3.build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows),
+    }
+    html = step3.render_html(benchmark, data)
+    html_path.write_text(html, encoding="utf-8")
+
+
 def write_outputs(report_data):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
@@ -1132,14 +1448,9 @@ def write_outputs(report_data):
 
     json_path.write_text(json.dumps(report_data, indent=2, sort_keys=True))
     md_path.write_text(build_markdown(report_data))
-    template = TEMPLATE.read_text()
-    marker = '<script id="report-data" type="application/json">\n%%REPORT_DATA_JSON%%\n</script>'
-    report_json = json.dumps(report_data, indent=2).replace("</", "<\\/")
-    replacement = f'<script id="report-data" type="application/json">\n{report_json}\n</script>'
-    if marker not in template:
-        raise RuntimeError("HTML template is missing the report-data placeholder block.")
-    html = template.replace(marker, replacement, 1)
-    html_path.write_text(html)
+    if not focus:
+        raise RuntimeError("Focused benchmark is required for Step 3 HTML output.")
+    render_step3_html(focus, html_path)
     return json_path, md_path, html_path
 
 

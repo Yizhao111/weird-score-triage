@@ -32,6 +32,16 @@ def read_tsv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f, delimiter="\t"))
 
 
+def read_optional_tsv(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    return read_tsv(path)
+
+
+def canonical_output_path(benchmark: str, output: Path, date_str: str) -> Path:
+    return output.parent / f"{benchmark}-step3-report-{date_str}.html"
+
+
 def build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows):
     error_categories = Counter(row["error_category"] for row in error_category_rows)
     error_types = Counter(row["error_name"] for row in error_type_rows)
@@ -53,10 +63,18 @@ def build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows):
     }
 
 
-def build_combined_rows(ok_rows, error_category_rows):
+def build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows):
     ok_index = {
         (row["task"], row["agent"], row["model"]): row
         for row in ok_rows
+    }
+    missing_index = {
+        (row["task"], row["agent"], row["model"]): row
+        for row in missing_rows
+    }
+    reasoning_index = {
+        (row["task"], row["agent"], row["model"]): row
+        for row in reasoning_rows
     }
     category_index = {}
     for row in error_category_rows:
@@ -64,9 +82,11 @@ def build_combined_rows(ok_rows, error_category_rows):
         category_index.setdefault(key, []).append(row)
 
     combined_rows = []
-    all_keys = sorted(set(ok_index) | set(category_index))
+    all_keys = sorted(set(ok_index) | set(category_index) | set(missing_index) | set(reasoning_index))
     for key in all_keys:
         ok_row = ok_index.get(key, {})
+        missing_row = missing_index.get(key, {})
+        reasoning_row = reasoning_index.get(key, {})
         categories = category_index.get(key, [])
         base = {
             "task": key[0],
@@ -75,27 +95,39 @@ def build_combined_rows(ok_rows, error_category_rows):
             "n_trials": ok_row.get("n_trials") or (categories[0]["n_trials"] if categories else ""),
             "ok_runs": ok_row.get("ok_runs", "0"),
             "exception_summary": ok_row.get("exception_summary", ""),
-            "reward_mean": ok_row.get("reward_mean", ""),
-            "reward_std": ok_row.get("reward_std", ""),
-            "reward_std_large_flag": ok_row.get("reward_std_large_flag", "no"),
+            "reward_mean": ok_row.get("reward_mean") or missing_row.get("reward_mean", ""),
+            "reward_std": ok_row.get("reward_std") or missing_row.get("reward_std", ""),
+            "reward_std_large_flag": (
+                ok_row.get("reward_std_large_flag")
+                or missing_row.get("reward_std_large_flag")
+                or "no"
+            ),
+            "missing_agent_trajectory_json": missing_row.get("missing_agent_trajectory_json", "0"),
+            "missing_verifier_test_stdout_txt": missing_row.get("missing_verifier_test_stdout_txt", "0"),
+            "trajectory_json_path": missing_row.get("trajectory_json_path", ""),
+            "verifier_test_stdout_path": missing_row.get("verifier_test_stdout_path", ""),
+            "trajectory_last_step": missing_row.get("trajectory_last_step", ""),
+            "reasoning": reasoning_row.get("reasoning", ""),
         }
-        if not categories:
-            combined_rows.append(
-                {
-                    **base,
-                    "error_category": "",
-                    "matched_patterns": "",
-                }
+        error_categories = " | ".join(
+            row["error_category"] for row in categories if row.get("error_category")
+        )
+        matched_patterns = " || ".join(
+            (
+                f"{row['error_category']}: {row['matched_patterns']}"
+                if row.get("matched_patterns")
+                else row["error_category"]
             )
-            continue
-        for category_row in categories:
-            combined_rows.append(
-                {
-                    **base,
-                    "error_category": category_row["error_category"],
-                    "matched_patterns": category_row["matched_patterns"],
-                }
-            )
+            for row in categories
+            if row.get("error_category")
+        )
+        combined_rows.append(
+            {
+                **base,
+                "error_category": error_categories,
+                "matched_patterns": matched_patterns,
+            }
+        )
     return combined_rows
 
 
@@ -192,7 +224,7 @@ h1 {{
 }}
 .controls {{
   display: grid;
-  grid-template-columns: 2fr repeat(3, minmax(150px, 1fr));
+  grid-template-columns: 2fr repeat(3, minmax(150px, 1fr)) minmax(180px, 220px);
   gap: 10px;
   margin-bottom: 12px;
 }}
@@ -205,15 +237,37 @@ input, select {{
   color: var(--ink);
   font: inherit;
 }}
+.toggle-filter {{
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  white-space: nowrap;
+  color: var(--ink);
+  cursor: pointer;
+}}
+.toggle-filter.active {{
+  border-color: var(--orange);
+  background: #fff3e0;
+  color: var(--orange);
+}}
 .table-wrap {{
   border: 1px solid var(--line);
   border-radius: 8px;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
   background: var(--paper);
 }}
 table {{
   width: 100%;
+  min-width: 100%;
   border-collapse: collapse;
+}}
+.table-wrap[data-tab="merged"] table {{
+  min-width: 2200px;
 }}
 thead {{
   background: #f8fafc;
@@ -310,16 +364,12 @@ tr:last-child td {{ border-bottom: 0; }}
     </div>
   </div>
 
-  <div class="tabs">
-    <button class="tab active" data-tab="missing">Missing Extracted Files</button>
-    <button class="tab" data-tab="combined">Run Summary</button>
-  </div>
-
   <div class="controls">
     <input id="search" type="search" placeholder="Filter by task, agent, model, or pattern">
     <select id="task-filter"><option value="">All tasks</option></select>
     <select id="agent-filter"><option value="">All agents</option></select>
     <select id="model-filter"><option value="">All models</option></select>
+    <button id="orange-only" class="toggle-filter" type="button" aria-pressed="false">Only orange rows</button>
   </div>
 
   <div class="table-wrap">
@@ -335,17 +385,26 @@ tr:last-child td {{ border-bottom: 0; }}
 const DATA = JSON.parse(document.getElementById("report-data").textContent);
 
 const tabDefs = {{
-  missing: {{
-    rows: DATA.missing_rows,
-    columns: ["task", "agent", "model", "reward_mean", "reward_std", "missing_agent_trajectory_json", "missing_verifier_test_stdout_txt", "trajectory_json_path", "verifier_test_stdout_path"],
-  }},
-  combined: {{
+  merged: {{
     rows: DATA.combined_rows,
-    columns: ["task", "agent", "model", "n_trials", "exception_summary", "reward_mean", "reward_std", "error_category", "matched_patterns"],
+    columns: [
+      "task",
+      "agent",
+      "model",
+      "n_trials",
+      "exception_summary",
+      "reward_mean",
+      "reward_std",
+      "trajectory_json_path",
+      "verifier_test_stdout_path",
+      "error_category",
+      "matched_patterns",
+      "reasoning"
+    ],
   }},
 }};
 
-let currentTab = "missing";
+let currentTab = "merged";
 let sortState = {{ key: "", dir: "asc" }};
 
 function uniq(values) {{
@@ -380,11 +439,25 @@ function rowMatches(row) {{
   const task = document.getElementById("task-filter").value;
   const agent = document.getElementById("agent-filter").value;
   const model = document.getElementById("model-filter").value;
+  const orangeOnly = document.getElementById("orange-only").dataset.active === "true";
   if (task && row.task !== task) return false;
   if (agent && row.agent !== agent) return false;
   if (model && row.model !== model) return false;
+  if (orangeOnly && !isOrangeRow(row)) return false;
   if (!search) return true;
   return Object.values(row).join(" ").toLowerCase().includes(search);
+}}
+
+function isMissingRow(row) {{
+  return (
+    Number(row.missing_agent_trajectory_json || 0) > 0 ||
+    Number(row.missing_verifier_test_stdout_txt || 0) > 0 ||
+    rowIsStdOutlier(row)
+  );
+}}
+
+function isOrangeRow(row) {{
+  return !(row.exception_summary === "OK:5" || Number(row.ok_runs || 0) === 5);
 }}
 
 function cellClass(key, value, row) {{
@@ -488,6 +561,8 @@ function renderTable() {{
   const def = tabDefs[currentTab];
   const head = document.getElementById("head-row");
   const body = document.getElementById("body-rows");
+  const wrap = document.querySelector(".table-wrap");
+  wrap.dataset.tab = currentTab;
   head.innerHTML = buildHeadHtml(def.columns);
   bindHeadClicks();
   const rows = def.rows.filter(rowMatches).slice().sort(function (a, b) {{
@@ -496,31 +571,25 @@ function renderTable() {{
     return sortState.dir === "asc" ? cmp : -cmp;
   }});
   body.innerHTML = rows.map(row => {{
-    const highlightMissing =
-      currentTab === "missing" &&
-      (Number(row.missing_agent_trajectory_json || 0) > 0 ||
-       Number(row.missing_verifier_test_stdout_txt || 0) > 0 ||
-       rowIsStdOutlier(row));
-    const highlightAllOk =
-      currentTab === "combined" &&
-      !(row.exception_summary === "OK:5" || Number(row.ok_runs || 0) === 5);
+    const highlightMissing = isMissingRow(row);
+    const highlightAllOk = isOrangeRow(row);
     const rowClass = highlightMissing ? ' class="row-missing"' : highlightAllOk ? ' class="row-all-ok"' : "";
     return `<tr${rowClass}>${def.columns.map(col => `<td class="${cellClass(col, row[col], row)}">${renderCell(col, row[col], row)}</td>`).join("")}</tr>`;
   }}).join("");
 }}
 
-for (const tab of document.querySelectorAll(".tab")) {{
-  tab.addEventListener("click", () => {{
-    currentTab = tab.dataset.tab;
-    document.querySelectorAll(".tab").forEach(el => el.classList.toggle("active", el === tab));
-    renderTable();
-  }});
-}}
-
-for (const id of ["search", "task-filter", "agent-filter", "model-filter"]) {{
+for (const id of ["search", "task-filter", "agent-filter", "model-filter", "orange-only"]) {{
   document.getElementById(id).addEventListener("input", renderTable);
   document.getElementById(id).addEventListener("change", renderTable);
 }}
+
+document.getElementById("orange-only").addEventListener("click", function () {{
+  const next = this.dataset.active === "true" ? "false" : "true";
+  this.dataset.active = next;
+  this.setAttribute("aria-pressed", next);
+  this.classList.toggle("active", next === "true");
+  renderTable();
+}});
 
 fillSummary();
 fillFilters();
@@ -542,20 +611,31 @@ def main() -> None:
     error_category_rows = read_tsv(args.tables_dir / "error_categories.tsv")
     error_type_rows = read_tsv(args.tables_dir / "error_types.tsv")
     missing_rows = read_tsv(args.tables_dir / "missing_extracted_files.tsv")
-    combined_rows = build_combined_rows(ok_rows, error_category_rows)
+    reasoning_rows = read_optional_tsv(args.tables_dir / "reasoning.tsv")
+    combined_rows = build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows)
 
     data = {
         "ok_rows": ok_rows,
         "error_category_rows": error_category_rows,
         "error_type_rows": error_type_rows,
         "missing_rows": missing_rows,
+        "reasoning_rows": reasoning_rows,
         "combined_rows": combined_rows,
         "summary": build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows),
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(render_html(args.benchmark, data), encoding="utf-8")
+    html = render_html(args.benchmark, data)
+    args.output.write_text(html, encoding="utf-8")
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    stable_output = canonical_output_path(args.benchmark, args.output, date_str)
+    if stable_output != args.output:
+        stable_output.write_text(html, encoding="utf-8")
+
     print(args.output)
+    if stable_output != args.output:
+        print(stable_output)
 
 
 if __name__ == "__main__":
