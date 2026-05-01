@@ -719,7 +719,225 @@ The **Accuracy & Insight** tab contains:
    - **Model Laggards (across leaderboard)** — `get_leaderboard` data; computes per-model cross-agent mean and flags models whose mean inverts expected family ranking (>3pp gap) or is negative.
    - **Harness Laggards (across leaderboard)** — `get_leaderboard` data; flags (model, agent) pairs where the agent score is ≥15pp below the model's best-agent score.
 
+**Trajectory and stdout path cells** render as short labels (`trajectory.json1`, `trajectory.json2`, `test-stdout.txt1`, …). The full path is shown on native hover (title attribute) and the link opens the file directly. Hovering a `test-stdout.txt` label also shows a preview of the first 3 000 characters of that file in a tooltip panel.
+
+If `/tmp/<benchmark>_inversion_analysis.json` exists, each non-empty subsection bullet that matches an entry's `match_key` expands to show a collapsible **"Root-cause analysis ▸"** block with the subagent-produced root cause and per-task notes (see Step 3e).
+
 > **Note on `error_types.tsv`:** The script writes one row per trial (not one row per distinct type) so that `build_summary`'s `Counter` produces correct counts. Do not collapse this file to one row per type.
+
+### Step 3e — Insight analysis with subagents
+
+After Step 3d, open the **Accuracy & Insight** tab and check all six subsections. For any section that contains flagged items, run subagents to examine the extracted trajectories and produce a root-cause explanation that the HTML will render inline under each bullet as a collapsible **"Root-cause analysis ▸"** block.
+
+This applies to all six sections:
+- **Model Inversions** and **Agent Inversions** — computed from `ok_runs.tsv` `reward_mean`
+- **Native Agent Underperformance** — same source
+- **Cross-Family Surprises** — same source
+- **Model Laggards** and **Harness Laggards** — computed from `get_leaderboard` aggregate scores
+
+**When to run this step**
+- Any bullet appears in any Accuracy & Insight subsection.
+- Run after Step 3d so the report is already rendered and the finding list is known.
+
+**Step 1 — Compute findings for all sections**
+
+The HTML computes per-(model, agent) mean of `reward_mean` across all tasks from `ok_runs.tsv` for the task-level sections, and reads `/tmp/leaderboard_aggregate.json` for the leaderboard sections. Replicate both in Python to enumerate all flagged items and identify the worst tasks per finding:
+
+```python
+import csv, json
+from collections import defaultdict
+from pathlib import Path
+
+rows = list(csv.DictReader(open(f"/tmp/<benchmark>_step3_tables/ok_runs.tsv"), delimiter="\t"))
+
+MODEL_TIERS = {
+    "gpt-5.4": 3, "gpt-5-mini": 2, "gpt-5-nano": 1,
+    "claude-opus-4-6": 3, "claude-sonnet-4-6": 2, "claude-haiku-4-5-20251001": 1,
+    "gemini-3.1-pro-preview": 2, "gemini-3-flash-preview": 1,
+}
+AGENT_TIERS = {"codex": 4, "claude-code": 4, "gemini-cli": 3, "terminus-2": 2}
+NATIVE = {"gpt": "codex", "claude": "claude-code", "gemini": "gemini-cli"}
+
+def family(m):
+    if m.startswith("gpt"): return "openai"
+    if m.startswith("claude"): return "anthropic"
+    if m.startswith("gemini"): return "google"
+    return ""
+
+def native_agent(m):
+    for prefix, agent in NATIVE.items():
+        if m.startswith(prefix): return agent
+
+grouped = defaultdict(list)
+for r in rows:
+    try: grouped[(r["model"], r["agent"])].append(float(r["reward_mean"]))
+    except: pass
+cell_mean = {k: sum(v)/len(v) for k, v in grouped.items()}
+
+# --- Task-level sections (ok_runs.tsv) ---
+# Model inversions: stronger model >5pp below weaker peer on same agent
+for agent in sorted({a for _, a in cell_mean}):
+    pairs = [(m, cell_mean[(m, agent)]) for m in MODEL_TIERS if (m, agent) in cell_mean]
+    for m_s, s_s in pairs:
+        for m_w, s_w in pairs:
+            if family(m_s) != family(m_w) or MODEL_TIERS[m_s] <= MODEL_TIERS[m_w]: continue
+            if s_w - s_s > 0.05:
+                print(f"MODEL INVERSION agent={agent}: {m_s}={s_s:.3f} < {m_w}={s_w:.3f}")
+
+# Agent inversions: stronger agent >5pp below weaker agent on same model
+for model in sorted({m for m, _ in cell_mean}):
+    pairs = [(a, cell_mean[(model, a)]) for a in AGENT_TIERS if (model, a) in cell_mean]
+    for a_s, s_s in pairs:
+        for a_w, s_w in pairs:
+            if AGENT_TIERS.get(a_s, 0) <= AGENT_TIERS.get(a_w, 0): continue
+            if s_w - s_s > 0.05:
+                print(f"AGENT INVERSION model={model}: {a_s}={s_s:.3f} < {a_w}={s_w:.3f}")
+
+# Native agent underperformance: native agent >10pp below another agent on same model
+for model in MODEL_TIERS:
+    nat = native_agent(model)
+    if not nat: continue
+    nat_score = cell_mean.get((model, nat))
+    if nat_score is None: continue
+    for agent in AGENT_TIERS:
+        if agent == nat: continue
+        other = cell_mean.get((model, agent))
+        if other and other > nat_score + 0.10:
+            print(f"NATIVE UNDERPERF {model}/{nat}={nat_score:.3f} < {model}/{agent}={other:.3f}")
+
+# Cross-family surprises: weaker-family model beats frontier of another family by >5pp
+frontier = {"openai": "gpt-5.4", "anthropic": "claude-opus-4-6", "google": "gemini-3.1-pro-preview"}
+for agent in AGENT_TIERS:
+    for model_w in MODEL_TIERS:
+        sw = cell_mean.get((model_w, agent))
+        if sw is None: continue
+        for fam_s, model_s in frontier.items():
+            if fam_s == family(model_w) or MODEL_TIERS[model_w] >= MODEL_TIERS[model_s]: continue
+            ss = cell_mean.get((model_s, agent))
+            if ss and sw > ss + 0.05:
+                print(f"CROSS-FAMILY {model_w}/{agent}={sw:.3f} > {model_s}/{agent}={ss:.3f}")
+
+# --- Leaderboard sections (leaderboard_aggregate.json) ---
+lb = json.loads(Path("/tmp/leaderboard_aggregate.json").read_text())
+lb_bm = [r for r in lb if r["benchmark"] == "<benchmark>"]
+lb_cell = {(r["model"], r["agent"]): r["score"] for r in lb_bm}
+lb_model_mean = defaultdict(list)
+for r in lb_bm: lb_model_mean[r["model"]].append(r["score"])
+lb_model_mean = {m: sum(v)/len(v) for m, v in lb_model_mean.items()}
+
+# Model laggards: stronger model cross-agent mean >3pp below weaker peer, or negative
+for m_s in MODEL_TIERS:
+    for m_w in MODEL_TIERS:
+        if family(m_s) != family(m_w) or MODEL_TIERS[m_s] <= MODEL_TIERS[m_w]: continue
+        s, w = lb_model_mean.get(m_s), lb_model_mean.get(m_w)
+        if s is not None and w is not None and w - s > 0.03:
+            print(f"MODEL LAGGARD {m_s} avg={s:.3f} < {m_w} avg={w:.3f}")
+    if lb_model_mean.get(m_s, 0) < 0:
+        print(f"MODEL LAGGARD {m_s} negative mean={lb_model_mean[m_s]:.3f}")
+
+# Harness laggards: agent >=15pp below that model's best agent score
+for model in MODEL_TIERS:
+    best = max((lb_cell.get((model, a), -999) for a in AGENT_TIERS), default=None)
+    if best is None: continue
+    for agent in AGENT_TIERS:
+        score = lb_cell.get((model, agent))
+        if score is not None and best - score >= 0.15:
+            print(f"HARNESS LAGGARD {model}/{agent}={score:.3f} (best={best:.3f}, gap={best-score:.3f})")
+```
+
+For each flagged pair, find the worst tasks (largest per-task score gap) to focus subagent inspection:
+
+```python
+# Example for one finding pair
+s_a = {r["task"]: float(r["reward_mean"]) for r in rows
+       if r["agent"] == "<agent>" and r["model"] == "<model_a>" and r["reward_mean"]}
+s_b = {r["task"]: float(r["reward_mean"]) for r in rows
+       if r["agent"] == "<agent>" and r["model"] == "<model_b>" and r["reward_mean"]}
+diffs = [(t, s_b[t] - s_a[t]) for t in set(s_a) & set(s_b)]
+diffs.sort(key=lambda x: -x[1])
+for t, d in diffs[:10]:
+    print(f"  {t}: a={s_a[t]:.3f}  b={s_b[t]:.3f}  gap={d:.3f}")
+```
+
+**Step 2 — Fan out subagents to examine trajectories**
+
+Spawn one subagent per finding in parallel. If orchestrator is **Claude Code**, use **Claude 4.5 Haiku**. If orchestrator is **Codex**, use **`gpt-5.4-mini`**.
+
+Each subagent receives:
+- The finding (models/agents involved, scores, section name)
+- The top 5 worst-gap tasks
+- The path template: `/tmp/<benchmark>/{task}/{model}/{agent}/{trial_id}/{run_dir}/`
+
+The subagent should:
+1. List trial IDs for the relevant models and agent on each task
+2. Read `agent/trajectory.json` (or `agent/<agent>.txt`) — compare step count, answer mechanism, output format
+3. Read `result.json` and `verifier/test-stdout.txt` for reward confirmation
+4. Identify the consistent behavioural difference that explains the finding
+
+**Output contract**
+
+Each subagent returns a JSON object. Merge all into `/tmp/<benchmark>_inversion_analysis.json` (a JSON array). Each entry must include `match_type` and `match_key` fields so the HTML knows how to attach it to the correct bullet:
+
+```json
+[
+  {
+    "type": "model",
+    "agent": "<agent>",
+    "stronger_model": "<model>",
+    "stronger_score": 0.180,
+    "weaker_model": "<model>",
+    "weaker_score": 0.236,
+    "gap": 0.056,
+    "root_cause": "<2-3 sentence explanation>",
+    "task_notes": [
+      {"task": "<task>", "note": "<1-2 sentence comparison>"},
+      ...
+    ]
+  },
+  {
+    "type": "harness_laggard",
+    "section": "Harness Laggards (across leaderboard)",
+    "match_type": "prefix",
+    "match_key": "<model>/<agent> (",
+    "primary_model": "<model>",
+    "agent": "<agent>",
+    "score": 0.000,
+    "root_cause": "<2-3 sentence explanation>",
+    "task_notes": [...]
+  },
+  {
+    "type": "cross_family",
+    "section": "Cross-Family Surprises",
+    "match_type": "contains",
+    "match_key": "<frontier_model> best=",
+    "primary_model": "<frontier_model_underperforming>",
+    "agent": "<agent>",
+    "root_cause": "<2-3 sentence explanation>",
+    "task_notes": [...]
+  }
+]
+```
+
+**`match_type` and `match_key` rules — critical for HTML rendering**
+
+The HTML matches each entry to the correct insight bullet using these fields. The bullet text format differs per section:
+
+| Section | Bullet format | `match_type` | `match_key` example |
+|---|---|---|---|
+| Model Inversions | `stronger/agent=0.180 is below weaker/agent=0.236.` | `prefix` | `gpt-5.4/terminus-2=` |
+| Agent Inversions | `model/stronger=0.500 is below model/weaker=0.600.` | `prefix` | `claude-opus-4-6/claude-code=` |
+| Cross-Family Surprises | `weaker/agent=0.236 exceeds frontier best=0.180.` | `contains` | `claude-opus-4-6 best=` |
+| Harness Laggards | `model/agent (0.0) is 77.8pp below model/best (77.8).` | `prefix` | `claude-opus-4-6/terminus-2 (` |
+| Model Laggards | `model avg 45.2 is 12.3pp below model avg 57.5 — …` | `prefix` | `claude-opus-4-6 avg ` |
+| Native Underperf. | `model/native=0.300 is below model/other=0.500.` | `prefix` | `claude-opus-4-6/claude-code=` |
+
+For **Model/Agent Inversion** entries without explicit `match_type`/`match_key`, the HTML defaults to prefix matching on `stronger_model/agent=` (or `model/stronger_agent=`).
+
+**Step 3 — Regenerate the HTML**
+
+Re-run Step 3d. The script reads `/tmp/<benchmark>_inversion_analysis.json` automatically and renders a collapsible **"Root-cause analysis ▸"** block under each matching bullet across all six Accuracy & Insight subsections.
+
+No flag is needed — if the file does not exist the tab renders normally without the detail blocks.
 
 ---
 

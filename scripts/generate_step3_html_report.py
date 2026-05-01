@@ -54,6 +54,14 @@ def read_leaderboard_scores(benchmark: str) -> list[dict]:
     return [r for r in rows if r.get("benchmark") == benchmark]
 
 
+def read_inversion_analysis(benchmark: str) -> list[dict]:
+    path = Path(f"/tmp/{benchmark}_inversion_analysis.json")
+    if not path.exists():
+        return []
+    with path.open() as f:
+        return json.load(f)
+
+
 def canonical_output_path(benchmark: str, output: Path, date_str: str) -> Path:
     return output.parent / f"{benchmark}-step3-report-{date_str}.html"
 
@@ -359,6 +367,43 @@ h1 {{
 .insight-list li {
   margin-bottom: 8px;
 }
+.inversion-detail {{
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}}
+.inversion-detail summary {{
+  cursor: pointer;
+  font-weight: 500;
+  color: var(--blue);
+  font-size: 12px;
+  user-select: none;
+}}
+.inversion-detail p {{
+  margin: 6px 0 8px;
+  color: var(--ink);
+  line-height: 1.5;
+}}
+.inversion-detail table {{
+  border-collapse: collapse;
+  width: 100%;
+  margin-top: 4px;
+}}
+.inversion-detail td {{
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  vertical-align: top;
+  line-height: 1.4;
+}}
+.inversion-detail td:first-child {{
+  white-space: nowrap;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  width: 180px;
+}}
 .tabs {{
   display: flex;
   gap: 8px;
@@ -948,6 +993,17 @@ function buildLeaderboardInsights(lbScores) {
 }
 const LEADERBOARD_INSIGHTS = buildLeaderboardInsights(DATA.leaderboard_scores);
 
+// Each entry in inversion_analysis may have:
+//   match_type: "prefix" (bullet starts with match_key) or "contains" (bullet includes match_key)
+//   match_key:  the key to test against the bullet text
+// Older model-inversion entries without these fields default to prefix matching on stronger_model/agent.
+const INVERSION_ENTRIES = (DATA.inversion_analysis || []).map(function(entry) {
+  const matchType = entry.match_type || "prefix";
+  const matchKey  = entry.match_key  || (entry.stronger_model + "/" + entry.agent + "=");
+  return { entry: entry, matchType: matchType, matchKey: matchKey,
+           sections: entry.section ? [entry.section] : null };
+});
+
 const tabDefs = {{
   rerun: {{
     rows: DATA.combined_rows,
@@ -1413,6 +1469,14 @@ function renderAccuracyInsightSections() {
     + '<p style="margin:0 0 10px;color:var(--muted);font-size:13px;">Weighted average scores from <code>get_leaderboard</code> (official benchmark-level aggregates, p_window=3). Hover a bar for the exact score.</p>'
     + '<div style="overflow-x:auto">' + renderLeaderboardChart(DATA.leaderboard_scores) + '</div>'
     + '</div>';
+  const inversionSections = new Set([
+    "Model Inversions (across this benchmark)",
+    "Agent Inversions (across this benchmark)",
+    "Native Agent Underperformance",
+    "Cross-Family Surprises",
+    "Model Laggards (across leaderboard)",
+    "Harness Laggards (across leaderboard)",
+  ]);
   const sections = [
     ["Model Inversions (across this benchmark)", ACCURACY_INSIGHT_SUMMARY["Model Inversions"] || [], "Per (model, agent) mean across tasks from extracted trial data. Flags stronger models scoring >5pp below weaker family peers on the same agent."],
     ["Agent Inversions (across this benchmark)", ACCURACY_INSIGHT_SUMMARY["Agent Inversions"] || [], "Per (model, agent) mean across tasks from extracted trial data. Flags stronger agents scoring >5pp below weaker agents on the same model."],
@@ -1427,8 +1491,30 @@ function renderAccuracyInsightSections() {
     if (!subset.length) {
       return `<section class="insight-section"><h3>${escapeHtml(title)}</h3><div class="insight-body">${subtitleHtml}<span class="insight-metric">0</span><div class="insight-empty">No examples found.</div></div></section>`;
     }
+    const withInversions = inversionSections.has(title);
     const items = subset.slice(0, 8).map(function (text) {
-      return `<li>${escapeHtml(text)}</li>`;
+      var detail = "";
+      if (withInversions) {
+        INVERSION_ENTRIES.forEach(function(item) {
+          if (item.sections && !item.sections.includes(title)) return;
+          const matched = item.matchType === "contains"
+            ? text.includes(item.matchKey)
+            : text.startsWith(item.matchKey);
+          if (!matched) return;
+          const entry = item.entry;
+          var noteRows = (entry.task_notes || []).map(function(n) {
+            const taskCell = escapeHtml(n.task);
+            const modelCell = n.model ? `<td>${escapeHtml(n.model)}</td>` : "";
+            return `<tr><td>${taskCell}</td>${modelCell}<td>${escapeHtml(n.note)}</td></tr>`;
+          }).join("");
+          detail = `<details class="inversion-detail">`
+            + `<summary>Root-cause analysis ▸</summary>`
+            + `<p>${escapeHtml(entry.root_cause)}</p>`
+            + (noteRows ? `<table>${noteRows}</table>` : "")
+            + `</details>`;
+        });
+      }
+      return `<li>${escapeHtml(text)}${detail}</li>`;
     }).join("");
     return `<section class="insight-section">`
       + `<h3>${escapeHtml(title)}</h3>`
@@ -1570,6 +1656,7 @@ def main() -> None:
         "combined_rows": combined_rows,
         "summary": build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows),
         "leaderboard_scores": read_leaderboard_scores(args.benchmark),
+        "inversion_analysis": read_inversion_analysis(args.benchmark),
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
