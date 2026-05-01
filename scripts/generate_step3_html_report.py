@@ -45,6 +45,15 @@ def read_optional_json(path: Path):
         return json.load(f)
 
 
+def read_leaderboard_scores(benchmark: str) -> list[dict]:
+    path = Path("/tmp/leaderboard_aggregate.json")
+    if not path.exists():
+        return []
+    with path.open() as f:
+        rows = json.load(f)
+    return [r for r in rows if r.get("benchmark") == benchmark]
+
+
 def canonical_output_path(benchmark: str, output: Path, date_str: str) -> Path:
     return output.parent / f"{benchmark}-step3-report-{date_str}.html"
 
@@ -559,6 +568,7 @@ tr:last-child td {{ border-bottom: 0; }}
       <div class="rerun-metric"><b id="rerun-maybe"></b><span>Re-run Maybe</span></div>
       <div class="rerun-metric"><b id="rerun-no"></b><span>Re-run No</span></div>
     </div>
+    <ul id="rerun-bullets" style="margin: 14px 0 0; padding-left: 20px; line-height: 1.7;"></ul>
   </div>
 
   <div id="difficulty-chart-panel" class="panel chart-panel hidden">
@@ -715,6 +725,78 @@ function buildAccuracyInsightSummary(rows) {
 }
 const ACCURACY_INSIGHT_SUMMARY = buildAccuracyInsightSummary(DATA.combined_rows);
 
+function buildLeaderboardInsights(lbScores) {
+  if (!lbScores || !lbScores.length) return {"Model Laggards": [], "Harness Laggards": []};
+  const byModel = {};
+  const byAgent = {};
+  lbScores.forEach(function(r) {
+    if (!byModel[r.model]) byModel[r.model] = {};
+    byModel[r.model][r.agent] = r.score;
+    if (!byAgent[r.agent]) byAgent[r.agent] = {};
+    byAgent[r.agent][r.model] = r.score;
+  });
+  const models = Object.keys(byModel);
+  const agents = Object.keys(byAgent);
+  function agentMean(agentScores) {
+    const vals = Object.values(agentScores).filter(Number.isFinite);
+    return vals.length ? vals.reduce(function(a,b){return a+b;},0)/vals.length : null;
+  }
+  const modelMeans = {};
+  models.forEach(function(m) { modelMeans[m] = agentMean(byModel[m]); });
+
+  // Model Laggards — stronger family member scores below weaker peer (>3pp gap), or negative mean
+  const modelLaggards = [];
+  const seen = new Set();
+  models.forEach(function(stronger) {
+    models.forEach(function(weaker) {
+      if (!strongerModel(stronger, weaker)) return;
+      const sm = modelMeans[stronger], wm = modelMeans[weaker];
+      if (!Number.isFinite(sm) || !Number.isFinite(wm) || sm >= wm - 0.03) return;
+      const key = stronger + ">" + weaker;
+      if (seen.has(key)) return;
+      seen.add(key);
+      const gap = ((wm - sm) * 100).toFixed(1);
+      modelLaggards.push(stronger + " avg " + (sm*100).toFixed(1) + " is " + gap + "pp below " + weaker + " avg " + (wm*100).toFixed(1) + " — expected ordering inverted.");
+    });
+  });
+  models.forEach(function(m) {
+    const mean = modelMeans[m];
+    if (Number.isFinite(mean) && mean < 0) {
+      modelLaggards.push(m + " avg " + (mean*100).toFixed(1) + " — negative mean score across all agents.");
+    }
+  });
+  modelLaggards.sort(function(a,b) {
+    const na = parseFloat((a.match(/(-?\d+\.\d+)pp/) || ["","0"])[1]);
+    const nb = parseFloat((b.match(/(-?\d+\.\d+)pp/) || ["","0"])[1]);
+    return nb - na;
+  });
+
+  // Harness Laggards — for each model, agents >15pp below that model's best-agent score
+  const harnessLaggards = [];
+  models.forEach(function(model) {
+    const agentScores = byModel[model];
+    const vals = Object.entries(agentScores).filter(function(e){ return Number.isFinite(e[1]); });
+    if (!vals.length) return;
+    vals.sort(function(a,b){return b[1]-a[1];});
+    const bestAgent = vals[0][0], bestScore = vals[0][1];
+    vals.forEach(function(entry) {
+      const agent = entry[0], score = entry[1];
+      if (agent === bestAgent) return;
+      const gap = (bestScore - score) * 100;
+      if (gap < 15) return;
+      harnessLaggards.push(model + "/" + agent + " (" + (score*100).toFixed(1) + ") is " + gap.toFixed(1) + "pp below " + model + "/" + bestAgent + " (" + (bestScore*100).toFixed(1) + ").");
+    });
+  });
+  harnessLaggards.sort(function(a,b) {
+    const ga = parseFloat((a.match(/(\d+\.\d+)pp/) || ["","0"])[1]);
+    const gb = parseFloat((b.match(/(\d+\.\d+)pp/) || ["","0"])[1]);
+    return gb - ga;
+  });
+
+  return {"Model Laggards": modelLaggards, "Harness Laggards": harnessLaggards};
+}
+const LEADERBOARD_INSIGHTS = buildLeaderboardInsights(DATA.leaderboard_scores);
+
 const tabDefs = {{
   rerun: {{
     rows: DATA.combined_rows,
@@ -774,27 +856,46 @@ function fillSummary() {{
 }}
 
 function fillRerunSummary() {{
-  const rows = Array.isArray(DATA.rerun_rows) ? DATA.rerun_rows : [];
+  const rerunRows = Array.isArray(DATA.rerun_rows) ? DATA.rerun_rows : [];
   const summary = DATA.rerun_summary && typeof DATA.rerun_summary === "object" ? DATA.rerun_summary : {{}};
+
+  // Build bullet list from combined_rows (has subagent reasoning merged in)
+  const bulletSource = DATA.combined_rows.filter(function (row) {{
+    return safeCell(row.rerun_recommendation) !== "";
+  }});
+
   const fallback = {{
-    cells_reviewed: rows.length,
-    rerun_yes: rows.filter(function (row) {{ return row.rerun_recommendation === "yes"; }}).length,
-    rerun_maybe: rows.filter(function (row) {{ return row.rerun_recommendation === "maybe"; }}).length,
-    rerun_no: rows.filter(function (row) {{ return row.rerun_recommendation === "no"; }}).length,
-    subagent_rows: rows.filter(function (row) {{ return safeCell(row.subagent_rerun_recommendation); }}).length,
-    subagent_overrides: rows.filter(function (row) {{
-      return safeCell(row.subagent_rerun_recommendation)
-        && safeCell(row.subagent_rerun_recommendation) !== safeCell(row.heuristic_rerun_recommendation);
-    }}).length,
+    cells_reviewed: bulletSource.length,
+    rerun_yes: bulletSource.filter(function (row) {{ return row.rerun_recommendation === "yes"; }}).length,
+    rerun_maybe: bulletSource.filter(function (row) {{ return row.rerun_recommendation === "maybe"; }}).length,
+    rerun_no: bulletSource.filter(function (row) {{ return row.rerun_recommendation === "no"; }}).length,
   }};
   const merged = Object.assign({{}}, fallback, summary);
   const summaryText = merged.summary
-    || `Reviewed ${merged.cells_reviewed || 0} orange cells. Final rerun labels prefer subagent judgments when present and otherwise fall back to the heuristic pass.`;
+    || `Reviewed ${{merged.cells_reviewed || 0}} orange cells. Final rerun labels prefer subagent judgments when present and otherwise fall back to the heuristic pass.`;
   document.getElementById("rerun-summary-text").textContent = summaryText;
   document.getElementById("rerun-reviewed").textContent = merged.cells_reviewed || 0;
   document.getElementById("rerun-yes").textContent = merged.rerun_yes || 0;
   document.getElementById("rerun-maybe").textContent = merged.rerun_maybe || 0;
   document.getElementById("rerun-no").textContent = merged.rerun_no || 0;
+
+  const COLOR = {{ yes: "#067647", maybe: "#b54708", no: "#667085" }};
+  const ORDER = {{ yes: 0, maybe: 1, no: 2 }};
+  const sorted = bulletSource.slice().sort(function (a, b) {{
+    const oa = ORDER[a.rerun_recommendation] ?? 9;
+    const ob = ORDER[b.rerun_recommendation] ?? 9;
+    if (oa !== ob) return oa - ob;
+    return (a.task + a.agent + a.model).localeCompare(b.task + b.agent + b.model);
+  }});
+  const ul = document.getElementById("rerun-bullets");
+  ul.innerHTML = sorted.map(function (row) {{
+    const rec = safeCell(row.rerun_recommendation);
+    const color = COLOR[rec] || "#667085";
+    const label = `<strong style="color:${{color}}">${{escapeHtml(rec.toUpperCase())}}</strong>`;
+    const cell = `<span class="mono">${{escapeHtml(row.task)}} / ${{escapeHtml(row.agent)}} / ${{escapeHtml(row.model)}}</span>`;
+    const reason = safeCell(row.rerun_reason);
+    return `<li>${{label}} — ${{cell}}${{reason ? ` — ${{escapeHtml(reason)}}` : ""}}</li>`;
+  }}).join("");
 }}
 
 function fillFilters() {{
@@ -829,14 +930,11 @@ function applyTabControlVisibility() {{
   const isHighDifficulty = currentTab === "high-difficulty";
   const isAccuracyInsight = currentTab === "accuracy-insight";
   const isRerun = currentTab === "rerun";
-  orangeOnly.classList.toggle("hidden", isHighDifficulty);
+  orangeOnly.classList.toggle("hidden", !isRerun);
   difficultyBand.classList.toggle("hidden", !isHighDifficulty);
   chartPanel.classList.toggle("hidden", !isHighDifficulty);
   insightPanel.classList.toggle("hidden", !isAccuracyInsight);
   rerunPanel.classList.toggle("hidden", !isRerun);
-  if (currentTab !== "rerun") {
-    orangeOnly.classList.add("hidden");
-  }
 }
 
 function isMissingRow(row) {{
@@ -848,7 +946,7 @@ function isMissingRow(row) {{
 }}
 
 function isOrangeRow(row) {{
-  return !(row.exception_summary === "OK:5" || Number(row.ok_runs || 0) === 5);
+  return Number(row.ok_runs || 0) < 3;
 }}
 
 function cellClass(key, value, row) {{
@@ -1222,24 +1320,141 @@ function renderDifficultyChart(items, thresholds) {{
   svg.innerHTML = gridLines + bars;
 }
 
+function renderLeaderboardChart(scores) {{
+  if (!scores || !scores.length) {{
+    return '<p style="color:var(--muted);padding:4px 0">No get_leaderboard data found at /tmp/leaderboard_aggregate.json for this benchmark.</p>';
+  }}
+  const MODEL_LABELS = {{
+    "gpt-5.4": "GPT 5.4",
+    "gpt-5-mini": "GPT 5 Mini",
+    "gpt-5-nano": "GPT 5 Nano",
+    "claude-opus-4-6": "Claude Opus 4.6",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+    "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
+    "gemini-3-flash-preview": "Gemini 3 Flash",
+  }};
+  const AGENT_COLORS = {{
+    "codex":      "#b5d4b0",
+    "terminus-2": "#c8b8e8",
+    "claude-code":"#f5cdb4",
+    "gemini-cli": "#aacce8",
+  }};
+  // build model -> agent -> score lookup
+  const byModel = {{}};
+  scores.forEach(function(r) {{
+    if (!byModel[r.model]) byModel[r.model] = {{}};
+    byModel[r.model][r.agent] = r.score;
+  }});
+  const agents = [...new Set(scores.map(function(r) {{ return r.agent; }}))].sort();
+  // sort models by best score desc
+  const models = Object.keys(byModel).sort(function(a, b) {{
+    const bA = Math.max.apply(null, Object.values(byModel[a]));
+    const bB = Math.max.apply(null, Object.values(byModel[b]));
+    return bB - bA;
+  }});
+  // dimensions
+  const barH = 17, barGap = 3, groupGap = 12;
+  const padL = 148, padR = 170, padT = 20, padB = 48;
+  const W = 860;
+  const totalBars = models.reduce(function(s, m) {{ return s + agents.filter(function(a) {{ return byModel[m][a] !== undefined; }}).length; }}, 0);
+  const H = padT + padB + totalBars * (barH + barGap) + models.length * groupGap;
+  const chartW = W - padL - padR;
+  // x range (multiply by 100 for % display)
+  const allScores = scores.map(function(r) {{ return r.score; }});
+  const rawMin = Math.min.apply(null, allScores);
+  const rawMax = Math.max.apply(null, allScores);
+  const xMinVal = Math.min(rawMin, 0);
+  const xMaxVal = rawMax + (rawMax - rawMin) * 0.08;
+  const xRange = xMaxVal - xMinVal;
+  function xPx(v) {{ return padL + (v - xMinVal) / xRange * chartW; }}
+  const x0 = xPx(0);
+  // ticks at nice multiples of 0.1 (displayed as %)
+  const tickStep = xRange <= 0.5 ? 0.1 : xRange <= 1.2 ? 0.2 : 0.5;
+  const tickStart = Math.ceil(xMinVal / tickStep) * tickStep;
+  const ticks = [];
+  for (let t = tickStart; t <= xMaxVal + 1e-9; t += tickStep) ticks.push(Math.round(t * 1e6) / 1e6);
+  let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:' + W + 'px;display:block">';
+  // vertical grid lines + x axis tick labels
+  ticks.forEach(function(tick) {{
+    const x = xPx(tick);
+    svg += '<line x1="' + x.toFixed(1) + '" y1="' + padT + '" x2="' + x.toFixed(1) + '" y2="' + (H - padB) + '" stroke="#ebebeb" stroke-width="1"/>';
+    svg += '<text x="' + x.toFixed(1) + '" y="' + (H - padB + 16) + '" text-anchor="middle" fill="#667085" font-size="11">' + (tick * 100).toFixed(0) + '</text>';
+  }});
+  // zero line when negatives exist
+  if (rawMin < 0) {{
+    svg += '<line x1="' + x0.toFixed(1) + '" y1="' + padT + '" x2="' + x0.toFixed(1) + '" y2="' + (H - padB) + '" stroke="#adb5bd" stroke-width="1.5" stroke-dasharray="4 3"/>';
+  }}
+  // bars
+  let curY = padT;
+  models.forEach(function(model) {{
+    const modelAgents = agents.filter(function(a) {{ return byModel[model][a] !== undefined; }});
+    const groupH = modelAgents.length * (barH + barGap) - barGap;
+    const labelY = (curY + groupH / 2 + 4.5).toFixed(1);
+    const label = MODEL_LABELS[model] || model;
+    svg += '<text x="' + (padL - 10) + '" y="' + labelY + '" text-anchor="end" fill="#17202a" font-size="13">' + escapeHtml(label) + '</text>';
+    modelAgents.forEach(function(agent) {{
+      const score = byModel[model][agent];
+      const color = AGENT_COLORS[agent] || "#d0d5dd";
+      const xLeft  = xPx(Math.min(score, 0));
+      const xRight = xPx(Math.max(score, 0));
+      const bw = Math.max(xRight - xLeft, 1);
+      svg += '<rect x="' + xLeft.toFixed(1) + '" y="' + curY.toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + barH + '" fill="' + color + '" rx="3"><title>' + escapeHtml(agent) + ': ' + (score * 100).toFixed(1) + '</title></rect>';
+      // score label just after bar
+      const lx = (xPx(Math.max(score, 0)) + 5).toFixed(1);
+      const ly = (curY + barH - 4).toFixed(1);
+      svg += '<text x="' + lx + '" y="' + ly + '" fill="#374151" font-size="11">' + (score * 100).toFixed(1) + '</text>';
+      curY += barH + barGap;
+    }});
+    curY += groupGap;
+  }});
+  // x axis baseline
+  svg += '<line x1="' + padL + '" y1="' + (H - padB) + '" x2="' + (W - padR) + '" y2="' + (H - padB) + '" stroke="#d0d5dd" stroke-width="1"/>';
+  // x axis label
+  svg += '<text x="' + (padL + chartW / 2).toFixed(1) + '" y="' + (H - padB + 34) + '" text-anchor="middle" fill="#374151" font-size="12">Benchmark score</text>';
+  // legend (top-right)
+  const lx0 = W - padR + 20;
+  let ly = padT + 4;
+  svg += '<text x="' + lx0 + '" y="' + ly + '" fill="#374151" font-size="12" font-weight="600">Agent</text>';
+  ly += 20;
+  agents.forEach(function(agent) {{
+    const color = AGENT_COLORS[agent] || "#d0d5dd";
+    svg += '<rect x="' + lx0 + '" y="' + (ly - 11) + '" width="14" height="14" fill="' + color + '" rx="3"/>';
+    svg += '<text x="' + (lx0 + 20) + '" y="' + ly + '" fill="#374151" font-size="12">' + escapeHtml(agent) + '</text>';
+    ly += 22;
+  }});
+  svg += '</svg>';
+  return svg;
+}}
+
 function renderAccuracyInsightSections() {
   const panel = document.getElementById("accuracy-insight-panel");
+  const chartHtml = '<div style="grid-column:1/-1;border:1px solid var(--line);border-radius:8px;background:var(--paper);padding:14px;margin-bottom:4px">'
+    + '<h2 style="margin:0 0 4px;font-size:15px;">Agent × Model Score</h2>'
+    + '<p style="margin:0 0 10px;color:var(--muted);font-size:13px;">Weighted average scores from <code>get_leaderboard</code> (official benchmark-level aggregates, p_window=3). Hover a bar for the exact score.</p>'
+    + '<div style="overflow-x:auto">' + renderLeaderboardChart(DATA.leaderboard_scores) + '</div>'
+    + '</div>';
   const sections = [
     ["Model Inversions", ACCURACY_INSIGHT_SUMMARY["Model Inversions"] || []],
     ["Agent Inversions", ACCURACY_INSIGHT_SUMMARY["Agent Inversions"] || []],
     ["Native Agent Underperformance", ACCURACY_INSIGHT_SUMMARY["Native Agent Underperformance"] || []],
     ["Cross-Family Surprises", ACCURACY_INSIGHT_SUMMARY["Cross-Family Surprises"] || []],
+    ["Model Laggards", LEADERBOARD_INSIGHTS["Model Laggards"] || [], "Models whose aggregate score inverts expected family ranking or is negative (from get_leaderboard)."],
+    ["Harness Laggards", LEADERBOARD_INSIGHTS["Harness Laggards"] || [], "Agent/model pairs where the harness score is ≥15pp below the model’s best-agent score (from get_leaderboard)."],
   ];
-  panel.innerHTML = sections.map(function ([title, subset]) {
+  panel.innerHTML = chartHtml + sections.map(function (entry) {
+    const title = entry[0], subset = entry[1], subtitle = entry[2] || "";
+    const subtitleHtml = subtitle ? `<p style="margin:0 0 8px;color:var(--muted);font-size:12px">${escapeHtml(subtitle)}</p>` : "";
     if (!subset.length) {
-      return `<section class="insight-section"><h3>${title}</h3><div class="insight-body"><span class="insight-metric">0</span><div class="insight-empty">No benchmark-level examples under the current aggregate checks.</div></div></section>`;
+      return `<section class="insight-section"><h3>${escapeHtml(title)}</h3><div class="insight-body">${subtitleHtml}<span class="insight-metric">0</span><div class="insight-empty">No examples found.</div></div></section>`;
     }
-    const items = subset.slice(0, 5).map(function (text) {
+    const items = subset.slice(0, 8).map(function (text) {
       return `<li>${escapeHtml(text)}</li>`;
     }).join("");
     return `<section class="insight-section">`
-      + `<h3>${title}</h3>`
+      + `<h3>${escapeHtml(title)}</h3>`
       + `<div class="insight-body">`
+      + subtitleHtml
       + `<span class="insight-metric">${subset.length}</span>`
       + `<ul class="insight-list">${items}</ul>`
       + `</div>`
@@ -1416,6 +1631,7 @@ def main() -> None:
         "rerun_summary": rerun_summary,
         "combined_rows": combined_rows,
         "summary": build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows),
+        "leaderboard_scores": read_leaderboard_scores(args.benchmark),
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

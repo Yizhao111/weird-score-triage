@@ -680,6 +680,14 @@ The report now renders a single merged table with:
 
 The top summary panels show **Top Error Categories**, **Top Error Types**, and **Missing Extracted Files** totals. The table supports free-text search, dropdown filters for task/agent/model, and an `Only orange rows` toggle button. If `/tmp/<benchmark>_step3_tables/reasoning.tsv` exists, the HTML joins it automatically and shows a `reasoning` column.
 
+The **Re-run Summary** panel (visible on the Re-run analysis tab) shows four aggregate metric boxes (cells reviewed, yes, maybe, no) followed by a **bullet list** of every reviewed orange cell. Each bullet is formatted as:
+
+```
+<YES|MAYBE|NO> — <task> / <agent> / <model> — <rerun_justification>
+```
+
+Bullets are colour-coded (green = yes, orange = maybe, grey = no) and sorted yes → maybe → no. The `generate_step3_html_report.py` script must populate `#rerun-bullets` from `combined_rows` (which has subagent reasoning merged in) inside `fillRerunSummary()`.
+
 > **Note on `error_types.tsv`:** The script writes one row per trial (not one row per distinct type) so that `build_summary`'s `Counter` produces correct counts. Do not collapse this file to one row per type.
 
 ---
