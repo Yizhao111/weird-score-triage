@@ -678,7 +678,9 @@ The report now renders a single merged table with:
 - merged `error_category` and `matched_patterns`
 - optional subagent-produced `reasoning`
 
-The top summary panels show **Top Error Categories**, **Top Error Types**, and **Missing Extracted Files** totals. The table supports free-text search, dropdown filters for task/agent/model, and an `Only orange rows` toggle button. If `/tmp/<benchmark>_step3_tables/reasoning.tsv` exists, the HTML joins it automatically and shows a `reasoning` column.
+The top summary panels show **Top Error Categories**, **Top Error Types**, and **Missing Extracted Files** totals. The table supports free-text search and dropdown filters for task/agent/model. The **Only orange rows** toggle is visible only on the Re-run Analysis tab. If `/tmp/<benchmark>_step3_tables/reasoning.tsv` exists, the HTML joins it automatically and shows a `reasoning` column.
+
+**Orange row criteria:** a row is highlighted orange when `ok_runs < 3` (fewer than 3 successful trials, matching the `p_window=3` scoring window). A deeper orange (`row-missing`) is applied when trajectory or verifier stdout files are missing, or when `reward_std` is above the benchmark's 75th-percentile std.
 
 The **Re-run Summary** panel (visible on the Re-run analysis tab) shows four aggregate metric boxes (cells reviewed, yes, maybe, no) followed by a **bullet list** of every reviewed orange cell. Each bullet is formatted as:
 
@@ -686,7 +688,19 @@ The **Re-run Summary** panel (visible on the Re-run analysis tab) shows four agg
 <YES|MAYBE|NO> — <task> / <agent> / <model> — <rerun_justification>
 ```
 
-Bullets are colour-coded (green = yes, orange = maybe, grey = no) and sorted yes → maybe → no. The `generate_step3_html_report.py` script must populate `#rerun-bullets` from `combined_rows` (which has subagent reasoning merged in) inside `fillRerunSummary()`.
+Bullets are colour-coded (green = yes, orange = maybe, grey = no) and sorted yes → maybe → no. The `generate_step3_html_report.py` script populates `#rerun-bullets` from `combined_rows` (which has subagent reasoning merged in) inside `fillRerunSummary()`.
+
+The **Accuracy & Insight** tab contains:
+
+1. **Agent × Model Score chart** — horizontal grouped bar chart (models on Y axis sorted by best score desc, agents as bar series with pastel colours, score labels at bar ends, legend on the right). Data source: `get_leaderboard` scores read from `/tmp/leaderboard_aggregate.json`. The script's `read_leaderboard_scores(benchmark)` function filters this file for the current benchmark and passes the result as `DATA.leaderboard_scores`.
+
+2. **Six insight subsections** (2-column grid below the chart):
+   - **Model Inversions (across this benchmark)** — task-level extracted trial data; flags stronger models scoring >5pp below weaker family peers on the same agent.
+   - **Agent Inversions (across this benchmark)** — task-level extracted trial data; flags stronger agents scoring >5pp below weaker agents on the same model.
+   - **Native Agent Underperformance** — task-level data; flags models scoring significantly lower on their native agent than on others.
+   - **Cross-Family Surprises** — task-level data; flags weaker models outperforming frontier models from other families.
+   - **Model Laggards (across leaderboard)** — `get_leaderboard` data; computes per-model cross-agent mean and flags models whose mean inverts expected family ranking (>3pp gap) or is negative.
+   - **Harness Laggards (across leaderboard)** — `get_leaderboard` data; flags (model, agent) pairs where the agent score is ≥15pp below the model's best-agent score.
 
 > **Note on `error_types.tsv`:** The script writes one row per trial (not one row per distinct type) so that `build_summary`'s `Counter` produces correct counts. Do not collapse this file to one row per type.
 

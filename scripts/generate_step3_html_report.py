@@ -1435,12 +1435,12 @@ function renderAccuracyInsightSections() {
     + '<div style="overflow-x:auto">' + renderLeaderboardChart(DATA.leaderboard_scores) + '</div>'
     + '</div>';
   const sections = [
-    ["Model Inversions", ACCURACY_INSIGHT_SUMMARY["Model Inversions"] || []],
-    ["Agent Inversions", ACCURACY_INSIGHT_SUMMARY["Agent Inversions"] || []],
+    ["Model Inversions (across this benchmark)", ACCURACY_INSIGHT_SUMMARY["Model Inversions"] || [], "Per (model, agent) mean across tasks from extracted trial data. Flags stronger models scoring >5pp below weaker family peers on the same agent."],
+    ["Agent Inversions (across this benchmark)", ACCURACY_INSIGHT_SUMMARY["Agent Inversions"] || [], "Per (model, agent) mean across tasks from extracted trial data. Flags stronger agents scoring >5pp below weaker agents on the same model."],
     ["Native Agent Underperformance", ACCURACY_INSIGHT_SUMMARY["Native Agent Underperformance"] || []],
     ["Cross-Family Surprises", ACCURACY_INSIGHT_SUMMARY["Cross-Family Surprises"] || []],
-    ["Model Laggards", LEADERBOARD_INSIGHTS["Model Laggards"] || [], "Models whose aggregate score inverts expected family ranking or is negative (from get_leaderboard)."],
-    ["Harness Laggards", LEADERBOARD_INSIGHTS["Harness Laggards"] || [], "Agent/model pairs where the harness score is ≥15pp below the model’s best-agent score (from get_leaderboard)."],
+    ["Model Laggards (across leaderboard)", LEADERBOARD_INSIGHTS["Model Laggards"] || [], "Per-model mean across all agents from get_leaderboard. Flags models whose cross-agent average inverts expected family ranking or is negative."],
+    ["Harness Laggards (across leaderboard)", LEADERBOARD_INSIGHTS["Harness Laggards"] || [], "Per (model, agent) score from get_leaderboard. Flags agents ≥15pp below the same model’s best-agent score."],
   ];
   panel.innerHTML = chartHtml + sections.map(function (entry) {
     const title = entry[0], subset = entry[1], subtitle = entry[2] || "";
