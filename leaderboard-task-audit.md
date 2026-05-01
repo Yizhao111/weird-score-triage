@@ -635,7 +635,7 @@ After generating the Step 3 tables, use subagents to inspect the extracted files
 - `agent/trajectory.json` when present, or the fact that it is missing
 - `verifier/test-stdout.txt` when present
 - `verifier/reward.txt` when present
-- `result.json` when present
+- `result.json` when present — check `agent_execution.start_time` and `end_time`. If the exception is `AgentTimeoutError` and `end_time − start_time` equals the configured agent timeout, the timeout is genuine (the agent hit the wall clock limit, not a transient cancellation)
 - `trial.log` when present
 
 **Output contract**
