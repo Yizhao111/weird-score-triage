@@ -340,7 +340,8 @@ Example:
 BENCHMARK="$ARGUMENTS" \
 python3 - << 'PYEOF'
 import os
-import tarfile
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 benchmark = os.environ["BENCHMARK"].strip()
@@ -352,17 +353,33 @@ archives = sorted(archive_root.glob("*/*/*/*.tar.gz"))
 if not archives:
     raise SystemExit(f"No archives found under {archive_root}")
 
-for tgz_path in archives:
+def extract_one(tgz_path):
     rel = tgz_path.relative_to(archive_root)
     task_name, model, agent, filename = rel.parts
     trial_id = filename.removesuffix(".tar.gz")
     out_dir = extract_root / task_name / model / agent / trial_id
+    if out_dir.exists():
+        return "skipped"
     out_dir.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(tgz_path, "r:gz") as tf:
-        tf.extractall(out_dir)
+    subprocess.run(["tar", "-xzf", str(tgz_path), "-C", str(out_dir)], check=True)
+    return "extracted"
+
+errors = []
+counts = {"extracted": 0, "skipped": 0}
+with ThreadPoolExecutor(max_workers=(os.cpu_count() or 1) * 2) as ex:
+    futures = {ex.submit(extract_one, p): p for p in archives}
+    for f in as_completed(futures):
+        try:
+            counts[f.result()] += 1
+        except Exception as e:
+            errors.append(f"{futures[f]}: {e}")
 
 print(f"Benchmark: {benchmark}")
 print(f"Archives: {len(archives)}")
+print(f"Extracted: {counts['extracted']}  Skipped (already done): {counts['skipped']}")
+print(f"Errors: {len(errors)}")
+if errors:
+    print("\n".join(errors[:5]))
 print(f"Extracted root: {extract_root}")
 PYEOF
 ```

@@ -162,7 +162,7 @@ def render_html(benchmark: str, data: dict) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__BENCHMARK__ Step 3 Report</title>
+<title>__BENCHMARK__ Audit Report</title>
 <style>
 :root {{
   --bg: #f6f7f9;
@@ -512,7 +512,7 @@ tr:last-child td {{ border-bottom: 0; }}
 </head>
 <body>
 <header>
-  <h1>__BENCHMARK__ Step 3 Report</h1>
+  <h1>__BENCHMARK__ Audit Report</h1>
   <div class="meta">Generated __GENERATED__. Interactive report over the extracted-trial audit tables: merged run summary and missing extracted files.</div>
 </header>
 <div class="wrap">
