@@ -79,6 +79,28 @@ def build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows):
     }
 
 
+_STDOUT_PREVIEW_CHARS = 3000
+
+
+def _read_stdout_previews(paths_str: str) -> str:
+    """Read up to _STDOUT_PREVIEW_CHARS chars from each test-stdout.txt path, joined by ' || '."""
+    if not paths_str:
+        return ""
+    previews = []
+    for path in paths_str.split(" | "):
+        path = path.strip()
+        if not path:
+            continue
+        try:
+            text = Path(path).read_text(errors="replace")
+            if len(text) > _STDOUT_PREVIEW_CHARS:
+                text = text[:_STDOUT_PREVIEW_CHARS] + "\n...[truncated]"
+            previews.append(text)
+        except OSError:
+            previews.append("[file not found]")
+    return " || ".join(previews)
+
+
 def build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows, rerun_rows):
     ok_index = {
         (row["task"], row["agent"], row["model"]): row
@@ -127,6 +149,7 @@ def build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_ro
             "missing_verifier_test_stdout_txt": missing_row.get("missing_verifier_test_stdout_txt", "0"),
             "trajectory_json_path": missing_row.get("trajectory_json_path", ""),
             "verifier_test_stdout_path": missing_row.get("verifier_test_stdout_path", ""),
+            "verifier_test_stdout_content": _read_stdout_previews(missing_row.get("verifier_test_stdout_path", "")),
             "trajectory_last_step": missing_row.get("trajectory_last_step", ""),
             "reasoning": reasoning_row.get("reasoning", ""),
             "rerun_recommendation": reasoning_row.get("rerun_recommendation") or rerun_row.get("rerun_recommendation", ""),
@@ -155,7 +178,7 @@ def build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_ro
 
 
 def render_html(benchmark: str, data: dict) -> str:
-    payload = json.dumps(data)
+    payload = json.dumps(data).replace("</", "<\\/")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     template = """<!doctype html>
 <html lang="en">
@@ -398,13 +421,9 @@ table {{
   min-width: 100%;
   border-collapse: collapse;
 }}
-.table-wrap[data-tab="rerun"] table,
-.table-wrap[data-tab="high-difficulty"] table {{
+.table-wrap[data-tab="rerun"] table {{
   min-width: 2200px;
 }}
-.table-wrap[data-tab="high-difficulty"] table {{
-  min-width: 1100px;
-}
 thead {{
   background: #f8fafc;
 }}
@@ -603,10 +622,10 @@ tr:last-child td {{ border-bottom: 0; }}
   <div class="tabs">
     <button class="tab active" data-tab="rerun">Re-run analysis</button>
     <button class="tab" data-tab="accuracy-insight">Accuracy & Insight</button>
-    <button class="tab" data-tab="high-difficulty">High Difficulty</button>
   </div>
 
   <button id="rerun-instructions-btn" class="instructions-btn" style="display:none" type="button">📋 Instructions</button>
+  <button id="insight-instructions-btn" class="instructions-btn" style="display:none" type="button">📋 Instructions</button>
 
   <div class="controls">
     <input id="search" type="search" placeholder="Filter by task, agent, model, or pattern">
@@ -614,13 +633,6 @@ tr:last-child td {{ border-bottom: 0; }}
     <select id="agent-filter"><option value="">All agents</option></select>
     <select id="model-filter"><option value="">All models</option></select>
     <button id="orange-only" class="toggle-filter" type="button" aria-pressed="false">Only orange rows</button>
-    <select id="difficulty-band" class="hidden">
-      <option value="">All tasks</option>
-      <option value="high">High difficulty (top 25%)</option>
-      <option value="above-median">Above median</option>
-      <option value="below-median">Below median</option>
-      <option value="low">Low difficulty (bottom 25%)</option>
-    </select>
   </div>
 
   <div id="rerun-summary-panel" class="panel rerun-panel hidden">
@@ -633,14 +645,6 @@ tr:last-child td {{ border-bottom: 0; }}
       <div class="rerun-metric"><b id="rerun-no"></b><span>Re-run No</span></div>
     </div>
     <ul id="rerun-bullets" style="margin: 14px 0 0; padding-left: 20px; line-height: 1.7;"></ul>
-  </div>
-
-  <div id="difficulty-chart-panel" class="panel chart-panel hidden">
-    <h2>High Difficulty Chart</h2>
-    <p class="chart-caption">Ranked horizontal bar chart of task-level difficulty scores. `difficulty_score = 0.40 * low_reward_signal + 0.20 * low_ok_signal + 0.15 * failure_mix_signal + 0.15 * frontier_struggle_signal + 0.10 * variance_signal`.</p>
-    <div class="chart-frame">
-      <svg id="difficulty-chart" role="img" aria-label="High difficulty ranked bar chart"></svg>
-    </div>
   </div>
 
   <div id="accuracy-insight-panel" class="insight-sections hidden"></div>
@@ -711,6 +715,28 @@ tr:last-child td {{ border-bottom: 0; }}
     <p>These are platform-side issues and should not count as the model's real performance.</p>
     <h4>2. Agent interrupted before completing</h4>
     <p>Rerun if the agent was interrupted mid-run by an external issue — such as API rate limiting, API timeout, sandbox interruption, or verifier download failure — and the cell still has fewer than 3 valid OK trials.</p>
+    <hr>
+    <p>Once you've triaged the orange rows, fill in your findings here:</p>
+    <a href="https://docs.google.com/document/d/19v5UlRBecPm_hNDsj1oE4X-SPiI9mUpTqLK-t6lqdbY/edit?tab=t.0#heading=h.56j7yxv0uyk6"
+       target="_blank" rel="noopener noreferrer"
+       style="display:inline-flex;align-items:center;gap:6px;margin-top:4px;padding:8px 14px;background:var(--blue);color:#fff;border-radius:6px;text-decoration:none;font-weight:500;font-size:13px;">
+      Fill in re-run findings ↗
+    </a>
+  </div>
+</div>
+
+<div id="insight-instructions-modal" class="modal-overlay" role="dialog" aria-modal="true">
+  <div class="modal">
+    <button class="close-btn" id="insight-modal-close" aria-label="Close">×</button>
+    <h2>Accuracy &amp; Insight — Guide</h2>
+    <p style="color:var(--muted);font-size:13px;margin:0 0 16px">How to interpret the score chart and insight subsections.</p>
+    <hr>
+    <p>Once you validate the abnormal behavior, fill in:</p>
+    <a href="https://docs.google.com/document/d/19v5UlRBecPm_hNDsj1oE4X-SPiI9mUpTqLK-t6lqdbY/edit?tab=t.0#heading=h.mdovut8re9iz"
+       target="_blank" rel="noopener noreferrer"
+       style="display:inline-flex;align-items:center;gap:6px;margin-top:4px;padding:8px 14px;background:var(--blue);color:#fff;border-radius:6px;text-decoration:none;font-weight:500;font-size:13px;">
+      Open instructions doc ↗
+    </a>
   </div>
 </div>
 
@@ -946,17 +972,6 @@ const tabDefs = {{
     rows: DATA.combined_rows,
     columns: [],
   }},
-  "high-difficulty": {{
-    rows: DATA.combined_rows,
-    columns: [
-      "agent",
-      "model",
-      "n_trials",
-      "exception_summary",
-      "reward_mean",
-      "reward_std"
-    ],
-  }},
 }};
 
 let currentTab = "rerun";
@@ -1048,17 +1063,13 @@ function rowMatches(row) {{
 
 function applyTabControlVisibility() {{
   const orangeOnly = document.getElementById("orange-only");
-  const difficultyBand = document.getElementById("difficulty-band");
-  const chartPanel = document.getElementById("difficulty-chart-panel");
   const insightPanel = document.getElementById("accuracy-insight-panel");
   const rerunPanel = document.getElementById("rerun-summary-panel");
-  const isHighDifficulty = currentTab === "high-difficulty";
   const isAccuracyInsight = currentTab === "accuracy-insight";
   const isRerun = currentTab === "rerun";
   orangeOnly.classList.toggle("hidden", !isRerun);
   document.getElementById("rerun-instructions-btn").style.display = isRerun ? "inline-flex" : "none";
-  difficultyBand.classList.toggle("hidden", !isHighDifficulty);
-  chartPanel.classList.toggle("hidden", !isHighDifficulty);
+  document.getElementById("insight-instructions-btn").style.display = isAccuracyInsight ? "inline-flex" : "none";
   insightPanel.classList.toggle("hidden", !isAccuracyInsight);
   rerunPanel.classList.toggle("hidden", !isRerun);
 }
@@ -1126,7 +1137,8 @@ function renderCell(key, value, row) {{
       var tooltip = lastSteps[idx]
         ? '<div class="tooltip-panel"><pre style="margin:0; font: inherit;">' + escapeHtml(prettyLastStep(lastSteps[idx])) + '</pre></div>'
         : "";
-      return '<div class="tooltip-wrap"><a class="path-link" href="file://' + encodeURI(path) + '">' + escapeHtml(path) + '</a>' + tooltip + '</div>';
+      var label = "trajectory.json" + (idx + 1);
+      return '<div class="tooltip-wrap"><a class="path-link" href="file://' + encodeURI(path) + '" title="' + escapeHtml(path) + '">' + label + '</a>' + tooltip + '</div>';
     }}).join("");
   }}
   if (key === "verifier_test_stdout_path" && safeValue) {{
@@ -1136,7 +1148,8 @@ function renderCell(key, value, row) {{
       var tooltip = content
         ? '<div class="tooltip-panel"><pre style="margin:0; font: inherit;">' + escapeHtml(content) + '</pre></div>'
         : "";
-      return '<div class="tooltip-wrap"><a class="path-link" href="file://' + encodeURI(path) + '">' + escapeHtml(path) + '</a>' + tooltip + '</div>';
+      var label = "test-stdout.txt" + (idx + 1);
+      return '<div class="tooltip-wrap"><a class="path-link" href="file://' + encodeURI(path) + '" title="' + escapeHtml(path) + '">' + label + '</a>' + tooltip + '</div>';
     }}).join("");
   }}
   return escapeHtml(safeValue);
@@ -1250,16 +1263,6 @@ function failureMixSignal(okRate) {{
   return clamp01(failureRate / 0.25);
 }}
 
-function rowDifficultySignal(row, bounded) {{
-  const n = Number(row.n_trials || 0);
-  const okRuns = Number(row.ok_runs || 0);
-  const okRate = n > 0 ? okRuns / n : 0;
-  const rewardMean = Number(row.reward_mean);
-  const okSignal = lowOkSignal(okRate);
-  const rewardSignal = lowRewardSignal(rewardMean, bounded, []);
-  return Math.max(okSignal, rewardSignal);
-}}
-
 function frontierStruggleSignal(rows, bounded) {{
   const targets = [
     ["gpt-5.4", "codex"],
@@ -1285,60 +1288,6 @@ function varianceSignal(taskStd, stdP75, stdP90) {{
   return clamp01((taskStd - stdP75) / (stdP90 - stdP75));
 }}
 
-function computeDifficultyScores(grouped) {{
-  const tasks = Array.from(grouped.keys());
-  const bounded = usesBoundedScores(DATA.combined_rows);
-  const rawSummaries = tasks.map(function (task) {{
-    const rows = grouped.get(task);
-    const summary = summarizeTaskRows(rows);
-    const rewardMean = Number(summary.reward_mean);
-    const okRate = summary.n_trials > 0 ? summary.ok_runs / summary.n_trials : 0;
-    return {{
-      task: task,
-      rows: rows,
-      summary: summary,
-      reward_mean: rewardMean,
-      ok_rate: okRate,
-    }};
-  }});
-  const rewardMeans = rawSummaries.map(function (item) {{ return item.reward_mean; }}).filter(Number.isFinite);
-  const taskStds = rawSummaries.map(function (item) {{ return Number(item.summary.reward_std); }}).filter(Number.isFinite);
-  const stdP75 = quantile(taskStds, 0.75);
-  const stdP90 = quantile(taskStds, 0.90);
-  rawSummaries.forEach(function (item) {{
-    const lowReward = lowRewardSignal(item.reward_mean, bounded, rewardMeans);
-    const lowOk = lowOkSignal(item.ok_rate);
-    const failureMix = failureMixSignal(item.ok_rate);
-    const frontier = frontierStruggleSignal(item.rows, bounded);
-    const variance = varianceSignal(Number(item.summary.reward_std), stdP75, stdP90);
-    // Higher scores mean "harder-looking" tasks: poor reward outcomes dominate,
-    // then low completion, exception burden, frontier-pair struggle, and variance as weaker support signals.
-    item.summary.difficulty_score = clamp01(
-      0.40 * lowReward +
-      0.20 * lowOk +
-      0.15 * failureMix +
-      0.15 * frontier +
-      0.10 * variance
-    );
-  }});
-  rawSummaries.sort(function (a, b) {{
-    const scoreDiff = (b.summary.difficulty_score || 0) - (a.summary.difficulty_score || 0);
-    if (scoreDiff !== 0) return scoreDiff;
-    return (a.reward_mean || Infinity) - (b.reward_mean || Infinity);
-  }});
-  const difficultyScores = rawSummaries
-    .map(function (item) {{ return Number(item.summary.difficulty_score); }})
-    .filter(Number.isFinite);
-  return {
-    items: rawSummaries,
-    thresholds: {
-      p25: quantile(difficultyScores, 0.25),
-      p50: quantile(difficultyScores, 0.50),
-      p75: quantile(difficultyScores, 0.75),
-    },
-  };
-}}
-
 function buildHeadHtml(columns) {{
   return columns.map(function (col) {{
     const indicator = sortState.key === col ? `<span class="sort-indicator">${sortState.dir === "asc" ? "↑" : "↓"}</span>` : "";
@@ -1346,104 +1295,8 @@ function buildHeadHtml(columns) {{
   }}).join("");
 }}
 
-function difficultyHeaderHtml() {{
-  return `difficulty score`
-    + `<div class="tooltip-wrap inline-help" aria-label="Difficulty score help">?`
-    + `<div class="tooltip-panel"><pre style="margin:0; font: inherit; white-space: pre-wrap;">difficulty_score = 0.40 * low_reward_signal
-+ 0.20 * low_ok_signal
-+ 0.15 * failure_mix_signal
-+ 0.15 * frontier_struggle_signal
-+ 0.10 * variance_signal
-
-failure_mix_signal is a low-gravity signal for non-OK trials, so a task with some exceptions can score low-but-nonzero instead of 0.000.</pre></div>`
-    + `</div>`;
-}
-
-function buildHighDifficultyHeadHtml() {{
-  const columns = [
-    ["agent", "agent"],
-    ["model", "model"],
-    ["n_trials", "n trials"],
-    ["exception_summary", "exception summary"],
-    ["reward_mean", "reward mean"],
-    ["reward_std", "reward std"],
-    ["difficulty_score", difficultyHeaderHtml()],
-  ];
-  return columns.map(function ([key, label]) {{
-    const active = sortState.key === key;
-    const indicator = active ? `<span class="sort-indicator">${sortState.dir === "asc" ? "↑" : "↓"}</span>` : "";
-    return `<th data-col="${key}">${label}${indicator}</th>`;
-  }}).join("");
-}
-
-function compareTaskSummaries(a, b, key) {{
-  const aSummary = a.summary || {};
-  const bSummary = b.summary || {};
-  if (key === "difficulty_score") return Number(aSummary.difficulty_score || 0) - Number(bSummary.difficulty_score || 0);
-  if (key === "n_trials") return Number(aSummary.n_trials || 0) - Number(bSummary.n_trials || 0);
-  if (key === "reward_mean") return Number(aSummary.reward_mean || 0) - Number(bSummary.reward_mean || 0);
-  if (key === "reward_std") return Number(aSummary.reward_std || 0) - Number(bSummary.reward_std || 0);
-  if (key === "exception_summary") return String(aSummary.exception_summary || "").localeCompare(String(bSummary.exception_summary || ""));
-  if (key === "agent") {{
-    const aAgent = a.rows.map(function (row) {{ return String(row.agent || ""); }}).sort()[0] || "";
-    const bAgent = b.rows.map(function (row) {{ return String(row.agent || ""); }}).sort()[0] || "";
-    return aAgent.localeCompare(bAgent);
-  }}
-  if (key === "model") {{
-    const aModel = a.rows.map(function (row) {{ return String(row.model || ""); }}).sort()[0] || "";
-    const bModel = b.rows.map(function (row) {{ return String(row.model || ""); }}).sort()[0] || "";
-    return aModel.localeCompare(bModel);
-  }}
-  return String(a.task || "").localeCompare(String(b.task || ""));
-}
-
 function escapeAttr(value) {{
   return escapeHtml(value).replaceAll("'", "&#39;");
-}
-
-function difficultyBandColor(score, thresholds) {{
-  if (!Number.isFinite(score)) return "#98a2b3";
-  if (Number.isFinite(thresholds.p75) && score >= thresholds.p75) return "#175cd3";
-  if (Number.isFinite(thresholds.p50) && score >= thresholds.p50) return "#36b37e";
-  if (Number.isFinite(thresholds.p25) && score < thresholds.p25) return "#98a2b3";
-  return "#f79009";
-}
-
-function renderDifficultyChart(items, thresholds) {{
-  const svg = document.getElementById("difficulty-chart");
-  if (!items.length) {{
-    svg.setAttribute("width", "960");
-    svg.setAttribute("height", "80");
-    svg.innerHTML = `<text x="24" y="40" fill="#667085" font-size="14">No tasks match the current difficulty filter.</text>`;
-    return;
-  }}
-  const leftPad = 260;
-  const rightPad = 40;
-  const topPad = 24;
-  const bottomPad = 30;
-  const rowHeight = 28;
-  const barHeight = 18;
-  const chartWidth = 960;
-  const barAreaWidth = chartWidth - leftPad - rightPad;
-  const height = topPad + bottomPad + items.length * rowHeight;
-  svg.setAttribute("width", String(chartWidth));
-  svg.setAttribute("height", String(height));
-  const gridLines = [0, 0.25, 0.5, 0.75, 1].map(function (tick) {{
-    const x = leftPad + tick * barAreaWidth;
-    return `<g><line x1="${x}" y1="${topPad - 8}" x2="${x}" y2="${height - bottomPad + 4}" stroke="#d0d5dd" stroke-dasharray="3 3"></line><text x="${x}" y="${height - 8}" text-anchor="middle" fill="#667085" font-size="11">${tick.toFixed(2)}</text></g>`;
-  }}).join("");
-  const bars = items.map(function (item, index) {{
-    const score = Number(item.summary.difficulty_score || 0);
-    const y = topPad + index * rowHeight;
-    const width = Math.max(0, score) * barAreaWidth;
-    const color = difficultyBandColor(score, thresholds);
-    return `<g>`
-      + `<text x="${leftPad - 12}" y="${y + 13}" text-anchor="end" fill="#17202a" font-size="12">${escapeHtml(item.task)}</text>`
-      + `<rect x="${leftPad}" y="${y}" width="${width}" height="${barHeight}" rx="4" fill="${color}"><title>${escapeAttr(item.task)}: ${score.toFixed(3)}</title></rect>`
-      + `<text x="${leftPad + width + 8}" y="${y + 13}" fill="#17202a" font-size="12">${score.toFixed(3)}</text>`
-      + `</g>`;
-  }}).join("");
-  svg.innerHTML = gridLines + bars;
 }
 
 function renderLeaderboardChart(scores) {{
@@ -1616,72 +1469,6 @@ function renderTable() {{
     return;
   }
   wrap.classList.remove("hidden");
-  if (currentTab === "high-difficulty") {{
-    if (!sortState.key) {{
-      sortState.key = "difficulty_score";
-      sortState.dir = "desc";
-    }}
-    head.innerHTML = buildHighDifficultyHeadHtml();
-    bindHeadClicks();
-    const grouped = new Map();
-    def.rows.filter(rowMatches).forEach(function (row) {{
-      if (!grouped.has(row.task)) grouped.set(row.task, []);
-      grouped.get(row.task).push(row);
-    }});
-    const scored = computeDifficultyScores(grouped);
-    const thresholds = scored.thresholds || {};
-    const difficultyBand = document.getElementById("difficulty-band").value;
-    let taskSummaries = scored.items;
-    if (difficultyBand === "high" && Number.isFinite(thresholds.p75)) {{
-      taskSummaries = taskSummaries.filter(function (item) {{ return Number(item.summary.difficulty_score) >= thresholds.p75; }});
-    }} else if (difficultyBand === "above-median" && Number.isFinite(thresholds.p50)) {{
-      taskSummaries = taskSummaries.filter(function (item) {{ return Number(item.summary.difficulty_score) >= thresholds.p50; }});
-    }} else if (difficultyBand === "below-median" && Number.isFinite(thresholds.p50)) {{
-      taskSummaries = taskSummaries.filter(function (item) {{ return Number(item.summary.difficulty_score) < thresholds.p50; }});
-    }} else if (difficultyBand === "low" && Number.isFinite(thresholds.p25)) {{
-      taskSummaries = taskSummaries.filter(function (item) {{ return Number(item.summary.difficulty_score) < thresholds.p25; }});
-    }}
-    taskSummaries.sort(function (a, b) {{
-      const cmp = compareTaskSummaries(a, b, sortState.key || "difficulty_score");
-      return sortState.dir === "asc" ? cmp : -cmp;
-    }});
-    renderDifficultyChart(taskSummaries, thresholds);
-    body.innerHTML = taskSummaries.map(function (item) {{
-      const task = item.task;
-      const rows = item.rows.slice().sort(function (a, b) {{
-        const agentCmp = String(a.agent || "").localeCompare(String(b.agent || ""));
-        if (agentCmp !== 0) return agentCmp;
-        return String(a.model || "").localeCompare(String(b.model || ""));
-      }});
-      const summary = item.summary;
-      const groupHeader = `<tr class="task-group"><td colspan="7">${escapeHtml(task)}</td></tr>`;
-      const children = rows.map(function (row) {{
-        const highlightMissing = isMissingRow(row);
-        const highlightAllOk = isOrangeRow(row);
-        const rowClass = highlightMissing ? "task-child row-missing" : highlightAllOk ? "task-child row-all-ok" : "task-child";
-        return `<tr class="${rowClass}">`
-          + `<td class="${cellClass("agent", row.agent, row)}">${renderCell("agent", row.agent, row)}</td>`
-          + `<td class="${cellClass("model", row.model, row)}">${renderCell("model", row.model, row)}</td>`
-          + `<td class="${cellClass("n_trials", row.n_trials, row)}">${renderCell("n_trials", row.n_trials, row)}</td>`
-          + `<td class="${cellClass("exception_summary", row.exception_summary, row)}">${renderCell("exception_summary", row.exception_summary, row)}</td>`
-          + `<td class="${cellClass("reward_mean", row.reward_mean, row)}">${renderCell("reward_mean", row.reward_mean, row)}</td>`
-          + `<td class="${cellClass("reward_std", row.reward_std, row)}">${renderCell("reward_std", row.reward_std, row)}</td>`
-          + `<td></td>`
-          + `</tr>`;
-      }}).join("");
-      const summaryRow = `<tr class="task-summary">`
-        + `<td>Task total</td>`
-        + `<td></td>`
-        + `<td class="mono">${summary.n_trials || ""}</td>`
-        + `<td>${escapeHtml(summary.exception_summary || "")}</td>`
-        + `<td class="mono">${summary.reward_mean == null ? "" : summary.reward_mean.toFixed(6)}</td>`
-        + `<td class="mono">${summary.reward_std == null ? "" : summary.reward_std.toFixed(6)}</td>`
-        + `<td class="mono task-score">${summary.difficulty_score == null ? "" : summary.difficulty_score.toFixed(3)}</td>`
-        + `</tr>`;
-      return groupHeader + children + summaryRow;
-    }}).join("");
-    return;
-  }}
   head.innerHTML = buildHeadHtml(def.columns);
   bindHeadClicks();
   const rows = def.rows.filter(rowMatches).slice().sort(function (a, b) {{
@@ -1700,15 +1487,13 @@ function renderTable() {{
 for (const tab of document.querySelectorAll(".tab")) {{
   tab.addEventListener("click", () => {{
     currentTab = tab.dataset.tab;
-    sortState = currentTab === "high-difficulty"
-      ? { key: "difficulty_score", dir: "desc" }
-      : { key: "", dir: "asc" };
+    sortState = {{ key: "", dir: "asc" }};
     document.querySelectorAll(".tab").forEach(el => el.classList.toggle("active", el === tab));
     renderTable();
   }});
 }}
 
-for (const id of ["search", "task-filter", "agent-filter", "model-filter", "orange-only", "difficulty-band"]) {{
+for (const id of ["search", "task-filter", "agent-filter", "model-filter", "orange-only"]) {{
   document.getElementById(id).addEventListener("input", renderTable);
   document.getElementById(id).addEventListener("change", renderTable);
 }}
@@ -1730,8 +1515,22 @@ document.getElementById("modal-close").addEventListener("click", function() {{
 document.getElementById("rerun-instructions-modal").addEventListener("click", function(e) {{
   if (e.target === this) this.classList.remove("open");
 }});
+
+document.getElementById("insight-instructions-btn").addEventListener("click", function() {{
+  document.getElementById("insight-instructions-modal").classList.add("open");
+}});
+document.getElementById("insight-modal-close").addEventListener("click", function() {{
+  document.getElementById("insight-instructions-modal").classList.remove("open");
+}});
+document.getElementById("insight-instructions-modal").addEventListener("click", function(e) {{
+  if (e.target === this) this.classList.remove("open");
+}});
+
 document.addEventListener("keydown", function(e) {{
-  if (e.key === "Escape") document.getElementById("rerun-instructions-modal").classList.remove("open");
+  if (e.key === "Escape") {{
+    document.getElementById("rerun-instructions-modal").classList.remove("open");
+    document.getElementById("insight-instructions-modal").classList.remove("open");
+  }}
 }});
 
 fillSummary();
