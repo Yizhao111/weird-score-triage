@@ -597,17 +597,18 @@ for (task, model, agent), ct in sorted(cells.items()):
             try:
                 tj = json.loads(Path(t["trajectory_path"]).read_text())
                 steps = tj.get("steps", [])
-                if steps:
-                    last_steps.append(f"{t['trial_id']}: {json.dumps(steps[-1])}")
+                last_steps.append(f"{t['trial_id']}: {json.dumps(steps[-1])}" if steps else "—")
             except Exception:
-                pass
+                last_steps.append("—")
+        else:
+            last_steps.append("—")
     mf_rows.append({"task": task, "agent": agent, "model": model,
         "reward_mean": rm, "reward_std": rs,
         "reward_std_large_flag": "yes" if (rs != "" and rs > p75_std) else "no",
         "missing_agent_trajectory_json":    sum(1 for t in ct if not t["has_trajectory"]),
         "missing_verifier_test_stdout_txt": sum(1 for t in ct if not t["has_verifier_stdout"]),
-        "trajectory_json_path":    " | ".join(t["trajectory_path"]     for t in ct if t["trajectory_path"]),
-        "verifier_test_stdout_path": " | ".join(t["verifier_stdout_path"] for t in ct if t["verifier_stdout_path"]),
+        "trajectory_json_path":    " | ".join(t["trajectory_path"] or "—" for t in ct),
+        "verifier_test_stdout_path": " | ".join(t["verifier_stdout_path"] or "—" for t in ct),
         "trajectory_last_step": " || ".join(last_steps)})
 with (OUT_DIR / "missing_extracted_files.tsv").open("w", newline="") as f:
     w = csv.DictWriter(f, fieldnames=list(mf_rows[0].keys()), delimiter="\t")

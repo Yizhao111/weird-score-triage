@@ -101,6 +101,24 @@ def build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows):
 _STDOUT_PREVIEW_CHARS = 3000
 
 
+def _read_reward_files(stdout_paths_str: str) -> str:
+    """Read verifier/reward.txt for each trial, using the stdout path to locate the run dir."""
+    if not stdout_paths_str:
+        return ""
+    rewards = []
+    for path in stdout_paths_str.split(" | "):
+        path = path.strip()
+        if not path or path == "—":
+            rewards.append("—")
+            continue
+        reward_path = Path(path).parent / "reward.txt"
+        try:
+            rewards.append(reward_path.read_text().strip())
+        except OSError:
+            rewards.append("—")
+    return " | ".join(rewards)
+
+
 def _read_stdout_previews(paths_str: str) -> str:
     """Read up to _STDOUT_PREVIEW_CHARS chars from each test-stdout.txt path, joined by ' || '."""
     if not paths_str:
@@ -108,7 +126,8 @@ def _read_stdout_previews(paths_str: str) -> str:
     previews = []
     for path in paths_str.split(" | "):
         path = path.strip()
-        if not path:
+        if not path or path == "—":
+            previews.append("")
             continue
         try:
             text = Path(path).read_text(errors="replace")
@@ -169,6 +188,7 @@ def build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_ro
             "trajectory_json_path": missing_row.get("trajectory_json_path", ""),
             "verifier_test_stdout_path": missing_row.get("verifier_test_stdout_path", ""),
             "verifier_test_stdout_content": _read_stdout_previews(missing_row.get("verifier_test_stdout_path", "")),
+            "verifier_reward": _read_reward_files(missing_row.get("verifier_test_stdout_path", "")),
             "trajectory_last_step": missing_row.get("trajectory_last_step", ""),
             "reasoning": reasoning_row.get("reasoning", ""),
             "rerun_recommendation": reasoning_row.get("rerun_recommendation") or rerun_row.get("rerun_recommendation", ""),
@@ -484,6 +504,10 @@ table {{
 }}
 .table-wrap[data-tab="rerun"] table {{
   min-width: 2200px;
+}}
+.col-stdout-wide {{
+  min-width: 220px;
+  width: 220px;
 }}
 thead {{
   background: #f8fafc;
@@ -1038,6 +1062,7 @@ const tabDefs = {{
       "reasoning",
       "trajectory_json_path",
       "verifier_test_stdout_path",
+      "verifier_reward",
       "error_category",
       "matched_patterns"
     ],
@@ -1185,7 +1210,8 @@ function cellClass(key, value, row) {{
     return "count-good mono";
   }}
   if (key === "reward_std" && String(value || "") && rowIsStdOutlier(row)) return "mono std-outlier";
-  if (key === "trajectory_json_path" || key === "verifier_test_stdout_path" || key === "trajectory_last_step") return "mono";
+  if (key === "verifier_test_stdout_path") return "mono col-stdout-wide";
+  if (key === "trajectory_json_path" || key === "trajectory_last_step") return "mono";
   if (key === "reward_mean" || key === "reward_std") return "mono";
   return "";
 }}
@@ -1229,6 +1255,7 @@ function renderCell(key, value, row) {{
         ? '<div class="tooltip-panel"><pre style="margin:0; font: inherit;">' + escapeHtml(prettyLastStep(lastSteps[idx])) + '</pre></div>'
         : "";
       var label = "trajectory.json" + (idx + 1);
+      if (path === "—") return '<span style="color:var(--muted)">' + label + '</span>';
       return '<div class="tooltip-wrap"><a class="path-link" href="file://' + encodeURI(path) + '" title="' + escapeHtml(path) + '">' + label + '</a>' + tooltip + '</div>';
     }}).join("");
   }}
@@ -1240,7 +1267,15 @@ function renderCell(key, value, row) {{
         ? '<div class="tooltip-panel"><pre style="margin:0; font: inherit;">' + escapeHtml(content) + '</pre></div>'
         : "";
       var label = "test-stdout.txt" + (idx + 1);
+      if (path === "—") return '<span style="color:var(--muted)">' + label + '</span>';
       return '<div class="tooltip-wrap"><a class="path-link" href="file://' + encodeURI(path) + '" title="' + escapeHtml(path) + '">' + label + '</a>' + tooltip + '</div>';
+    }}).join("");
+  }}
+  if (key === "verifier_reward" && safeValue) {{
+    return safeValue.split(" | ").map(function (val, idx) {{
+      const v = val.trim();
+      if (!v || v === "—") return '<div style="color:var(--muted);font-family:ui-monospace,monospace;font-size:12px">—</div>';
+      return '<div style="font-family:ui-monospace,monospace;font-size:12px">' + escapeHtml(v) + '</div>';
     }}).join("");
   }}
   return escapeHtml(safeValue);
