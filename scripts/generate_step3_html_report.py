@@ -54,6 +54,17 @@ def read_leaderboard_scores(benchmark: str) -> list[dict]:
     return [r for r in rows if r.get("benchmark") == benchmark]
 
 
+def read_experiment_owner(benchmark: str) -> str:
+    csv_path = Path(__file__).parent.parent / "experiment-track.csv"
+    if not csv_path.exists():
+        return ""
+    with csv_path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("Adapter Name", "").strip().lower() == benchmark.strip().lower():
+                return row.get("People", "").strip()
+    return ""
+
+
 def read_inversion_analysis(benchmark: str) -> list[dict]:
     path = Path(f"/tmp/{benchmark}_inversion_analysis.json")
     if not path.exists():
@@ -188,6 +199,11 @@ def build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_ro
 def render_html(benchmark: str, data: dict) -> str:
     payload = json.dumps(data).replace("</", "<\\/")
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    owner = read_experiment_owner(benchmark)
+    owner_line = (
+        f'<div class="meta" style="margin-top:4px">Experiment Owner: {owner}</div>'
+        if owner else ""
+    )
     template = """<!doctype html>
 <html lang="en">
 <head>
@@ -640,6 +656,7 @@ tr:last-child td {{ border-bottom: 0; }}
 <header>
   <h1>__BENCHMARK__ Audit Report</h1>
   <div class="meta">Generated __GENERATED__. Interactive report over the extracted-trial audit tables: merged run summary and missing extracted files.</div>
+  __OWNER_LINE__
 </header>
 <div class="wrap">
   <div class="stats">
@@ -677,6 +694,7 @@ tr:last-child td {{ border-bottom: 0; }}
     <select id="task-filter"><option value="">All tasks</option></select>
     <select id="agent-filter"><option value="">All agents</option></select>
     <select id="model-filter"><option value="">All models</option></select>
+    <select id="error-type-filter"><option value="">All error types</option></select>
     <button id="orange-only" class="toggle-filter" type="button" aria-pressed="false">Only orange rows</button>
   </div>
 
@@ -1101,6 +1119,17 @@ function fillFilters() {{
     el.innerHTML = `<option value="">All ${{key}}s</option>` + uniq(rows.map(row => row[key]))
       .map(value => `<option value="${{value}}">${{value}}</option>`).join("");
   }}
+  // Error type filter: extract distinct exception type names from exception_summary
+  const errorTypeSet = new Set();
+  rows.forEach(function(row) {{
+    safeCell(row.exception_summary).split(" | ").forEach(function(part) {{
+      const name = part.split(":")[0].trim();
+      if (name) errorTypeSet.add(name);
+    }});
+  }});
+  const errorTypeEl = document.getElementById("error-type-filter");
+  errorTypeEl.innerHTML = '<option value="">All error types</option>'
+    + Array.from(errorTypeSet).sort().map(name => `<option value="${{name}}">${{name}}</option>`).join("");
 }}
 
 function rowMatches(row) {{
@@ -1108,10 +1137,15 @@ function rowMatches(row) {{
   const task = document.getElementById("task-filter").value;
   const agent = document.getElementById("agent-filter").value;
   const model = document.getElementById("model-filter").value;
+  const errorType = document.getElementById("error-type-filter").value;
   const orangeOnly = document.getElementById("orange-only").dataset.active === "true";
   if (task && row.task !== task) return false;
   if (agent && row.agent !== agent) return false;
   if (model && row.model !== model) return false;
+  if (errorType) {{
+    const names = safeCell(row.exception_summary).split(" | ").map(p => p.split(":")[0].trim());
+    if (!names.includes(errorType)) return false;
+  }}
   if (orangeOnly && !isOrangeRow(row)) return false;
   if (!search) return true;
   return Object.values(row).join(" ").toLowerCase().includes(search);
@@ -1124,6 +1158,7 @@ function applyTabControlVisibility() {{
   const isAccuracyInsight = currentTab === "accuracy-insight";
   const isRerun = currentTab === "rerun";
   orangeOnly.classList.toggle("hidden", !isRerun);
+  document.getElementById("error-type-filter").classList.toggle("hidden", !isRerun);
   document.getElementById("rerun-instructions-btn").style.display = isRerun ? "inline-flex" : "none";
   document.getElementById("insight-instructions-btn").style.display = isAccuracyInsight ? "inline-flex" : "none";
   insightPanel.classList.toggle("hidden", !isAccuracyInsight);
@@ -1579,7 +1614,7 @@ for (const tab of document.querySelectorAll(".tab")) {{
   }});
 }}
 
-for (const id of ["search", "task-filter", "agent-filter", "model-filter", "orange-only"]) {{
+for (const id of ["search", "task-filter", "agent-filter", "model-filter", "error-type-filter", "orange-only"]) {{
   document.getElementById(id).addEventListener("input", renderTable);
   document.getElementById(id).addEventListener("change", renderTable);
 }}
@@ -1630,6 +1665,7 @@ renderTable();
     return (
         template.replace("__BENCHMARK__", benchmark)
         .replace("__GENERATED__", generated_at)
+        .replace("__OWNER_LINE__", owner_line)
         .replace("__DATA__", payload)
     )
 
