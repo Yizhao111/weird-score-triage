@@ -508,6 +508,68 @@ tr:last-child td {{ border-bottom: 0; }}
     max-width: 90vw;
   }}
 }}
+.instructions-btn {{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  margin-bottom: 10px;
+}}
+.instructions-btn:hover {{
+  border-color: var(--blue);
+  color: var(--blue);
+}}
+.modal-overlay {{
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(16,24,40,0.45);
+  z-index: 100;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 40px 16px;
+  overflow-y: auto;
+}}
+.modal-overlay.open {{ display: flex; }}
+.modal {{
+  background: var(--paper);
+  border-radius: 12px;
+  padding: 28px 32px 32px;
+  max-width: 720px;
+  width: 100%;
+  position: relative;
+  box-shadow: 0 20px 60px rgba(16,24,40,0.22);
+  line-height: 1.6;
+}}
+.modal h2 {{ margin: 0 0 4px; font-size: 18px; }}
+.modal h3 {{ margin: 20px 0 6px; font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }}
+.modal h4 {{ margin: 14px 0 4px; font-size: 14px; }}
+.modal p {{ margin: 0 0 10px; }}
+.modal ul, .modal ol {{ margin: 0 0 10px; padding-left: 22px; }}
+.modal li {{ margin-bottom: 4px; }}
+.modal hr {{ border: none; border-top: 1px solid var(--line); margin: 18px 0; }}
+.modal .close-btn {{
+  position: absolute;
+  top: 16px; right: 20px;
+  background: none; border: none;
+  font-size: 22px; color: var(--muted);
+  cursor: pointer; line-height: 1;
+}}
+.modal .close-btn:hover {{ color: var(--ink); }}
+.modal code {{
+  background: #f1f3f5;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}}
 </style>
 </head>
 <body>
@@ -543,6 +605,8 @@ tr:last-child td {{ border-bottom: 0; }}
     <button class="tab" data-tab="accuracy-insight">Accuracy & Insight</button>
     <button class="tab" data-tab="high-difficulty">High Difficulty</button>
   </div>
+
+  <button id="rerun-instructions-btn" class="instructions-btn" style="display:none" type="button">📋 Instructions</button>
 
   <div class="controls">
     <input id="search" type="search" placeholder="Filter by task, agent, model, or pattern">
@@ -586,6 +650,67 @@ tr:last-child td {{ border-bottom: 0; }}
       <thead><tr id="head-row"></tr></thead>
       <tbody id="body-rows"></tbody>
     </table>
+  </div>
+</div>
+
+<div id="rerun-instructions-modal" class="modal-overlay" role="dialog" aria-modal="true">
+  <div class="modal">
+    <button class="close-btn" id="modal-close" aria-label="Close">×</button>
+    <h2>Re-run Analysis — Triage Guide</h2>
+    <p style="color:var(--muted);font-size:13px;margin:0 0 16px">How to read orange rows and decide whether to rerun a cell.</p>
+    <hr>
+    <h3>Why a row is highlighted <span style="color:#b54708">orange</span></h3>
+    <p>A row is highlighted <span style="color:#b54708">orange</span> if it matches one or more of the following conditions:</p>
+    <ol>
+      <li><strong>OK count &lt; 3</strong> — fewer than 3 successful OK trials, below the <code>p_window=3</code> scoring requirement.</li>
+      <li><strong>Missing artifacts</strong> — one or more trials are missing <code>agent/trajectory.json</code> or <code>verifier/test-stdout.txt</code>.</li>
+      <li><strong>High variance</strong> — <code>reward_std</code> is above the benchmark's 75th-percentile std, indicating unstable results across trials.</li>
+    </ol>
+    <hr>
+    <h3>Validity rule</h3>
+    <p>A cell is acceptable if it has <strong>at least 3 confirmed valid OK trials</strong>.</p>
+    <p>If some trials are missing <code>trajectory.json</code> or <code>test-stdout.txt</code>, do not immediately mark the cell for rerun. Instead, check the other available artifacts:</p>
+    <ul>
+      <li><code>result.json</code></li>
+      <li><code>exception.txt</code></li>
+      <li><code>verifier/reward.txt</code></li>
+      <li>other verifier or agent logs</li>
+    </ul>
+    <p>If you can confirm ≥3 trials are valid OK runs, no rerun is needed — even if other trials have missing files.</p>
+    <hr>
+    <h3>How to handle AgentTimeoutError</h3>
+    <p><code>AgentTimeoutError</code> is common on hard tasks and should not automatically trigger a rerun.</p>
+    <h4>Usually valid timeout</h4>
+    <p>Treat the timeout as valid model behaviour if:</p>
+    <ul>
+      <li>the task has a normal timeout window (e.g. 10 minutes);</li>
+      <li><code>agent/trajectory.json</code> shows multiple steps with meaningful progress;</li>
+      <li>the last trajectory step looks like the agent was still working when the time limit was reached.</li>
+    </ul>
+    <p>In this case the timeout reflects the agent failing to finish within the allowed time — this is a capability signal, not an infra failure, and usually does not need a rerun.</p>
+    <h4>Suspicious timeout — consider rerun</h4>
+    <ul>
+      <li><code>agent/trajectory.json</code> is missing or has zero/very few steps;</li>
+      <li>the agent appears to have been blocked before real execution began;</li>
+      <li>the timeout was caused by an external issue such as rate limiting, API interruption, or sandbox failure.</li>
+    </ul>
+    <hr>
+    <h3>When to rerun</h3>
+    <p>Flag a cell for rerun when <strong>both</strong> conditions are true:</p>
+    <ol>
+      <li>The cell has fewer than 3 valid OK trials.</li>
+      <li>The non-OK trials appear to be caused by transient infrastructure or execution issues, not stable model behaviour.</li>
+    </ol>
+    <h4>1. Too few OK trials + infra failures</h4>
+    <p>Rerun if the cell has &lt;3 valid OKs and remaining trials failed due to:</p>
+    <ul>
+      <li><code>CancelledError</code>, <code>DaytonaError</code>, <code>DaytonaNotFoundError</code>, <code>DownloadVerifierDirError</code></li>
+      <li>Real API rate-limit errors: <code>credit balance is too low</code>, <code>quota exceeded</code>, <code>RESOURCE_EXHAUSTED</code></li>
+      <li>Sandbox setup or artifact download failures</li>
+    </ul>
+    <p>These are platform-side issues and should not count as the model's real performance.</p>
+    <h4>2. Agent interrupted before completing</h4>
+    <p>Rerun if the agent was interrupted mid-run by an external issue — such as API rate limiting, API timeout, sandbox interruption, or verifier download failure — and the cell still has fewer than 3 valid OK trials.</p>
   </div>
 </div>
 
@@ -931,6 +1056,7 @@ function applyTabControlVisibility() {{
   const isAccuracyInsight = currentTab === "accuracy-insight";
   const isRerun = currentTab === "rerun";
   orangeOnly.classList.toggle("hidden", !isRerun);
+  document.getElementById("rerun-instructions-btn").style.display = isRerun ? "inline-flex" : "none";
   difficultyBand.classList.toggle("hidden", !isHighDifficulty);
   chartPanel.classList.toggle("hidden", !isHighDifficulty);
   insightPanel.classList.toggle("hidden", !isAccuracyInsight);
@@ -1593,6 +1719,19 @@ document.getElementById("orange-only").addEventListener("click", function () {{
   this.setAttribute("aria-pressed", next);
   this.classList.toggle("active", next === "true");
   renderTable();
+}});
+
+document.getElementById("rerun-instructions-btn").addEventListener("click", function() {{
+  document.getElementById("rerun-instructions-modal").classList.add("open");
+}});
+document.getElementById("modal-close").addEventListener("click", function() {{
+  document.getElementById("rerun-instructions-modal").classList.remove("open");
+}});
+document.getElementById("rerun-instructions-modal").addEventListener("click", function(e) {{
+  if (e.target === this) this.classList.remove("open");
+}});
+document.addEventListener("keydown", function(e) {{
+  if (e.key === "Escape") document.getElementById("rerun-instructions-modal").classList.remove("open");
 }});
 
 fillSummary();
