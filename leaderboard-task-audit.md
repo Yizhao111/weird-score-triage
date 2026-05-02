@@ -5,7 +5,7 @@ description: Fetch the Harbor leaderboard from Supabase and surface anomalous sc
 
 # /leaderboard-task-audit — Harbor Benchmark Anomaly Detection
 
-For a particular benchmark, fetch the latest leaderboard data, download running trials tar.gz, and identify scores that violate known capability rankings or show systematic failures. Produce a structured report for the qual team.
+For a particular benchmark, fetch the latest leaderboard data, download running trials tar.gz, and identify scores that violate known capability rankings or show systematic failures. Produce a structured report for the qual team. Always feel free to spwawn subagents automatically.
 
 This skill only examines the three tracked model families: OpenAI (`gpt-5.4 > gpt-5-mini > gpt-5-nano`), Anthropic (`claude-opus-4-6 > claude-sonnet-4-6 > claude-haiku-4-5-20251001`), and Google (`gemini-3.1-pro-preview > gemini-3-flash-preview`). All other models in the leaderboard are filtered out.
 
@@ -631,7 +631,7 @@ After generating the Step 3 tables, use subagents to inspect the extracted files
 - These are the rows where reviewers benefit from a short explanation before opening raw logs.
 
 **What the subagent should inspect**
-- `exception.txt` when present
+- `exception.txt` when present, if you see agentnonzeroexit, then you must flag it as a maybe for rerun and explain that it may be a transient issue if there are no policy/refusal signals
 - `agent/trajectory.json` when present, or the fact that it is missing
 - `verifier/test-stdout.txt` when present
 - `verifier/reward.txt` when present
@@ -649,6 +649,8 @@ After generating the Step 3 tables, use subagents to inspect the extracted files
 **Rerun policy for subagents**
 - Valid reruns: rate-limit failures, Daytona/platform failures, `CancelledError`, and selected `NonZeroAgentExitCodeError` cases without API-policy or refusal signals
 - Usually not reruns: `RewardFileNotFoundError`, `AgentTimeoutError`, `VerifierTimeoutError`, stable wrong-answer behavior, and clear policy/refusal blocks
+- Special handling for `AgentTimeoutError`: distinguish early hangs from late non-convergence using trajectory evidence. If the trial has zero or near-zero agent steps and never reaches a meaningful tool/action phase, treat it as a stronger infra-hang candidate. If `agent/trajectory.json` shows substantial progress, especially roughly 30+ steps, repeated fitting/editing, or long exploratory loops before timeout, treat it as more likely a task/model/agent convergence or budget problem rather than transient infra.
+- Special handling for `RewardFileNotFoundError`: check `verifier/test-stdout.txt` and the extracted run files before assuming infra. If stdout shows the verifier could not find expected submission artifacts such as `/app/law.py`, `/app/explain.md`, `answer.txt`, or similar task outputs, and the trajectory suggests the agent never successfully wrote them, treat it as more likely a model/agent completion failure or output-format miss, especially for weaker models. Reserve infra-style rerun reasoning for cases where the agent clearly wrote the expected files and the reward file itself appears to be missing due to verifier-side failure.
 - The final HTML rerun summary is built from a merged pass: prefer subagent `rerun_recommendation` and `rerun_justification` when present, then fall back to the local heuristic pass for uncovered rows
 
 **Subagent fan-out requirement**
@@ -668,7 +670,7 @@ After generating the Step 3 tables, use subagents to inspect the extracted files
 **Suggested Codex prompt**
 
 ```text
-Analyze the assigned orange-highlighted Step 3 rows for <benchmark>. For each assigned (task, agent, model) cell that is not all-OK, inspect exception.txt, agent/trajectory.json, verifier/test-stdout.txt, and other local trial artifacts under /tmp/<benchmark>/ when useful. Write a partial TSV with columns task, agent, model, reasoning, rerun_recommendation, rerun_justification. Keep reasoning evidence-based and under 4 sentences, explain why the row is flagged, and classify reruns conservatively: yes for transient infra/quota/cancellation patterns, maybe for ambiguous NonZeroAgentExitCodeError cases without policy signals, and no for RewardFileNotFoundError, AgentTimeoutError, verifier timeout, policy/refusal, or stable behavior failures.
+Analyze the assigned orange-highlighted Step 3 rows for <benchmark>. For each assigned (task, agent, model) cell that is not all-OK, inspect exception.txt, agent/trajectory.json, verifier/test-stdout.txt, and other local trial artifacts under /tmp/<benchmark>/ when useful. Write a partial TSV with columns task, agent, model, reasoning, rerun_recommendation, rerun_justification. Keep reasoning evidence-based and under 4 sentences, explain why the row is flagged, and classify reruns conservatively: yes for transient infra/quota/cancellation patterns, maybe for ambiguous NonZeroAgentExitCodeError cases without policy signals, and no for RewardFileNotFoundError, AgentTimeoutError, verifier timeout, policy/refusal, or stable behavior failures. For AgentTimeoutError, explicitly use trajectory evidence: zero or near-zero steps suggests a possible hang, while substantial progress (for example ~30+ steps, repeated edits/fits, or long exploratory loops) suggests the agent ran but failed to conclude within budget. For RewardFileNotFoundError, explicitly check `verifier/test-stdout.txt` and whether the expected submission files were ever written; missing `/app/law.py` or analogous outputs usually points to model/agent failure to complete the contract, not a transient verifier issue.
 ```
 
 ### Step 3d — Render the HTML report

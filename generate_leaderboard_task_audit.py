@@ -1604,6 +1604,8 @@ def render_step3_html(benchmark, html_path):
         "rerun_summary": rerun_summary,
         "combined_rows": combined_rows,
         "summary": step3.build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows),
+        "leaderboard_scores": step3.read_leaderboard_scores(benchmark),
+        "inversion_analysis": step3.read_inversion_analysis(benchmark),
     }
     html = step3.render_html(benchmark, data)
     html_path.write_text(html, encoding="utf-8")

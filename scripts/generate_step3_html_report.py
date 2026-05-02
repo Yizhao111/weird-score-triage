@@ -1039,11 +1039,26 @@ const LEADERBOARD_INSIGHTS = buildLeaderboardInsights(DATA.leaderboard_scores);
 //   match_type: "prefix" (bullet starts with match_key) or "contains" (bullet includes match_key)
 //   match_key:  the key to test against the bullet text
 // Older model-inversion entries without these fields default to prefix matching on stronger_model/agent.
+function normalizeInsightSectionName(name) {
+  const raw = String(name || "").trim();
+  if (!raw) return "";
+  return raw
+    .replace(/\s*\(across this benchmark\)\s*$/i, "")
+    .replace(/\s*\(across leaderboard\)\s*$/i, "")
+    .trim();
+}
+
 const INVERSION_ENTRIES = (DATA.inversion_analysis || []).map(function(entry) {
   const matchType = entry.match_type || "prefix";
   const matchKey  = entry.match_key  || (entry.stronger_model + "/" + entry.agent + "=");
-  return { entry: entry, matchType: matchType, matchKey: matchKey,
-           sections: entry.section ? [entry.section] : null };
+  return {
+    entry: entry,
+    matchType: matchType,
+    matchKey: matchKey,
+    sections: entry.section
+      ? [normalizeInsightSectionName(entry.section), String(entry.section).trim()].filter(Boolean)
+      : null
+  };
 });
 
 const tabDefs = {{
@@ -1565,8 +1580,13 @@ function renderAccuracyInsightSections() {
     const items = subset.slice(0, 8).map(function (text) {
       var detail = "";
       if (withInversions) {
+        const normalizedTitle = normalizeInsightSectionName(title);
         INVERSION_ENTRIES.forEach(function(item) {
-          if (item.sections && !item.sections.includes(title)) return;
+          if (
+            item.sections &&
+            !item.sections.includes(title) &&
+            !item.sections.includes(normalizedTitle)
+          ) return;
           const matched = item.matchType === "contains"
             ? text.includes(item.matchKey)
             : text.startsWith(item.matchKey);
