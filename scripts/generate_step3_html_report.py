@@ -2,9 +2,13 @@
 import argparse
 import csv
 import json
+import re
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+
+HARBOR_ADAPTERS = Path("/tmp/harbor/adapters")
+MIX_JOBS = Path("/tmp/harbor-mix/benchmark_info_jobs")
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +56,295 @@ def read_leaderboard_scores(benchmark: str) -> list[dict]:
     with path.open() as f:
         rows = json.load(f)
     return [r for r in rows if r.get("benchmark") == benchmark]
+
+
+def norm(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def parse_score(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        match = re.search(r"-?\d+(?:\.\d+)?", value)
+        if not match:
+            return None
+        number = float(match.group())
+        return number / 100.0 if number > 1.5 else number
+    return None
+
+
+def agent_equivalent(a: str, b: str) -> bool:
+    left, right = norm(a), norm(b)
+    if left == right:
+        return True
+    groups = [
+        {"codex", "codexcli", "codexcloud"},
+        {"claudecode", "claudecodecli"},
+        {"geminicli"},
+        {"terminus2", "terminus1", "terminus"},
+    ]
+    return any(left in group and right in group for group in groups)
+
+
+def find_adapter_path(benchmark: str) -> Path | None:
+    if not HARBOR_ADAPTERS.is_dir():
+        return None
+    target = norm(benchmark)
+    exact = {norm(path.name): path for path in HARBOR_ADAPTERS.iterdir() if path.is_dir()}
+    if target in exact:
+        return exact[target]
+    for key, path in exact.items():
+        if target in key or key in target:
+            return path
+    return None
+
+
+def read_adapter_readme_note(adapter_path: Path | None) -> str:
+    if not adapter_path:
+        return "Adapter folder not available under /tmp/harbor/adapters."
+    readme = adapter_path / "README.md"
+    if not readme.exists():
+        return "Adapter README.md not available."
+    text = readme.read_text(errors="replace")
+    for line in text.splitlines():
+        clean = re.sub(r"\s+", " ", line.strip(" -#\t"))
+        if not 35 <= len(clean) <= 220:
+            continue
+        low = clean.lower()
+        if any(term in low for term in ["score", "metric", "accuracy", "pass", "reward", "timeout", "negative", "evaluation"]):
+            return clean
+    for line in text.splitlines():
+        clean = re.sub(r"\s+", " ", line.strip(" -#\t"))
+        if 35 <= len(clean) <= 220:
+            return clean
+    return "README present, but no concise scoring note was extracted."
+
+
+def read_parity_entries(adapter_path: Path | None) -> list[dict]:
+    if not adapter_path:
+        return []
+    path = adapter_path / "parity_experiment.json"
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text())
+    except Exception:
+        return []
+    records = raw if isinstance(raw, list) else [raw]
+    entries = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        score = None
+        for metric in record.get("metrics") or []:
+            if not isinstance(metric, dict):
+                continue
+            for key in ["harbor", "tb_adapter", "terminal_bench", "adapter", "adapted"]:
+                score = parse_score(metric.get(key))
+                if score is not None:
+                    break
+            if score is not None:
+                break
+        if score is None:
+            continue
+        entries.append(
+            {
+                "model": record.get("model", ""),
+                "agent": record.get("agent", ""),
+                "score": score,
+                "date": record.get("date", ""),
+            }
+        )
+    return entries
+
+
+def model_means_from_live_scores(lb_scores: list[dict]) -> dict[str, float]:
+    by_model = {}
+    for row in lb_scores:
+        model = row.get("model")
+        score = row.get("score")
+        if not model or not isinstance(score, (int, float)):
+            continue
+        by_model.setdefault(model, []).append(float(score))
+    return {model: sum(values) / len(values) for model, values in by_model.items() if values}
+
+
+def build_parity_insights(benchmark: str, lb_scores: list[dict]) -> tuple[list[str], str]:
+    adapter_path = find_adapter_path(benchmark)
+    subtitle = (
+        "Cross-reference live leaderboard model means against Harbor adapter parity baselines. "
+        + read_adapter_readme_note(adapter_path)
+    )
+    entries = read_parity_entries(adapter_path)
+    if not lb_scores:
+        return [], subtitle
+    if not adapter_path:
+        return [], subtitle
+    if not entries:
+        return [], subtitle
+
+    live_means = model_means_from_live_scores(lb_scores)
+    live_agents = {}
+    for row in lb_scores:
+        if row.get("model") and isinstance(row.get("score"), (int, float)):
+            live_agents.setdefault(row["model"], []).append((row.get("agent", ""), float(row["score"])))
+
+    bullets = []
+    for model in sorted(live_means):
+        same_model_entries = [entry for entry in entries if norm(entry.get("model", "")) == norm(model)]
+        if not same_model_entries:
+            continue
+        live_mean = live_means[model]
+        parity_mean = sum(entry["score"] for entry in same_model_entries) / len(same_model_entries)
+        direct_agent_overlap = any(
+            agent_equivalent(parity_entry.get("agent", ""), live_agent)
+            for parity_entry in same_model_entries
+            for live_agent, _ in live_agents.get(model, [])
+        )
+        delta = live_mean - parity_mean
+        if abs(delta) <= 0.05:
+            label = "EXPECTED"
+            relation = "matches"
+        elif delta < -0.10:
+            label = "REGRESSION"
+            relation = "is below"
+        elif delta > 0.10:
+            label = "NEEDS_INVESTIGATION"
+            relation = "is above"
+        else:
+            label = "CONTEXT_ONLY"
+            relation = "is near"
+        qualifier = "direct model/agent overlap" if direct_agent_overlap else "model-only context (agent mismatch or unavailable)"
+        date = next((entry.get("date") for entry in same_model_entries if entry.get("date")), "")
+        date_suffix = f" from {date}" if date else ""
+        bullets.append(
+            f"{label}: {model} live avg={live_mean:.3f} {relation} parity avg={parity_mean:.3f} by {delta:+.3f}{date_suffix}; {qualifier}."
+        )
+    return bullets, subtitle
+
+
+def history_file_index() -> dict[str, Path]:
+    if not MIX_JOBS.is_dir():
+        return {}
+    return {norm(path.stem): path for path in MIX_JOBS.glob('*.json')}
+
+
+def find_history_file(benchmark: str, index: dict[str, Path]) -> tuple[Path | None, float]:
+    target = norm(benchmark)
+    if target in index:
+        return index[target], 1.0
+    for key, path in index.items():
+        if target in key or key in target:
+            score = min(len(target), len(key)) / max(len(target), len(key))
+            return path, score
+    try:
+        from difflib import SequenceMatcher
+    except Exception:
+        return None, 0.0
+    scored = [(SequenceMatcher(None, target, key).ratio(), path) for key, path in index.items()]
+    if not scored:
+        return None, 0.0
+    best_score, best_path = max(scored, key=lambda item: item[0])
+    return (best_path, best_score) if best_score >= 0.6 else (None, 0.0)
+
+
+def score_from_result_entry(result_entry: dict):
+    scores = result_entry.get("scores") or []
+    preferred_metrics = [
+        "accuracy_overall",
+        "accuracy",
+        "score",
+        "resolved_rate",
+        "pass_rate",
+        "success_rate",
+    ]
+    for metric in preferred_metrics:
+        for item in scores:
+            if item.get("metric") == metric and isinstance(item.get("value"), (int, float)):
+                return float(item["value"])
+    numeric_scores = [float(item["value"]) for item in scores if isinstance(item.get("value"), (int, float))]
+    return numeric_scores[0] if numeric_scores else None
+
+
+def collect_history_series(results_over_time) -> dict[tuple[str, str], list[float]]:
+    series = {}
+    if isinstance(results_over_time, dict):
+        for key, value in results_over_time.items():
+            if "/" not in key:
+                continue
+            model, agent = key.split("/", 1)
+            if isinstance(value, list):
+                vals = [float(x) for x in value if isinstance(x, (int, float))]
+                if vals:
+                    series[(model, agent)] = vals
+            elif isinstance(value, (int, float)):
+                series[(model, agent)] = [float(value)]
+        return series
+    if isinstance(results_over_time, list):
+        dated_rows = sorted(
+            [row for row in results_over_time if isinstance(row, dict)],
+            key=lambda row: row.get("date", ""),
+        )
+        for row in dated_rows:
+            for result in row.get("results", []):
+                model = result.get("model")
+                agent = result.get("agent") or result.get("system_description") or result.get("system")
+                score = score_from_result_entry(result)
+                if not model or not agent or score is None:
+                    continue
+                series.setdefault((model, agent), []).append(score)
+    return series
+
+
+def build_history_insights(benchmark: str, lb_scores: list[dict]) -> tuple[list[str], str]:
+    live_means = model_means_from_live_scores(lb_scores)
+    if not live_means:
+        return [], "Cross-reference live model means against harbor-mix historical trends."
+    index = history_file_index()
+    if not index:
+        return [], "Cross-reference live model means against harbor-mix historical trends."
+    path, confidence = find_history_file(benchmark, index)
+    if not path:
+        return [], "Cross-reference live model means against harbor-mix historical trends."
+    try:
+        payload = json.loads(path.read_text())
+    except Exception as exc:
+        return [], f"History source: {path.name}."
+    series = collect_history_series(payload.get("results_over_time"))
+    if not series:
+        return [], f"History source: {path.name}."
+
+    model_latest = {}
+    for (model, _agent), values in series.items():
+        if not values:
+            continue
+        model_latest.setdefault(model, []).append(values[-1])
+
+    subtitle = f"Cross-reference live model means against harbor-mix historical trends from {path.name}." + (
+        f" Fuzzy match confidence={confidence:.2f}." if confidence < 1.0 else ""
+    )
+    bullets = []
+    for model in sorted(live_means):
+        candidates = [values for hist_model, values in model_latest.items() if norm(hist_model) == norm(model)]
+        if not candidates:
+            continue
+        flat = [value for values in candidates for value in values]
+        hist_mean = sum(flat) / len(flat)
+        live_mean = live_means[model]
+        delta = live_mean - hist_mean
+        if abs(delta) <= 0.05:
+            label = "STABLE"
+        elif delta < -0.10:
+            label = "REGRESSION"
+        elif delta > 0.10:
+            label = "INFLATION"
+        else:
+            label = "MILD_SHIFT"
+        bullets.append(
+            f"{label}: {model} live avg={live_mean:.3f}, latest history avg={hist_mean:.3f}, delta={delta:+.3f}."
+        )
+    return bullets, subtitle
 
 
 def read_experiment_owner(benchmark: str) -> str:
@@ -185,10 +478,12 @@ def build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_ro
             ),
             "missing_agent_trajectory_json": missing_row.get("missing_agent_trajectory_json", "0"),
             "missing_verifier_test_stdout_txt": missing_row.get("missing_verifier_test_stdout_txt", "0"),
+            "trial_folder_path": missing_row.get("trial_folder_path", ""),
             "trajectory_json_path": missing_row.get("trajectory_json_path", ""),
             "verifier_test_stdout_path": missing_row.get("verifier_test_stdout_path", ""),
             "verifier_test_stdout_content": _read_stdout_previews(missing_row.get("verifier_test_stdout_path", "")),
             "verifier_reward": _read_reward_files(missing_row.get("verifier_test_stdout_path", "")),
+            "exception_type": missing_row.get("exception_type", ""),
             "trajectory_last_step": missing_row.get("trajectory_last_step", ""),
             "reasoning": reasoning_row.get("reasoning", ""),
             "rerun_recommendation": reasoning_row.get("rerun_recommendation") or rerun_row.get("rerun_recommendation", ""),
@@ -1034,6 +1329,8 @@ function buildLeaderboardInsights(lbScores) {
   return {"Model Laggards": modelLaggards, "Harness Laggards": harnessLaggards};
 }
 const LEADERBOARD_INSIGHTS = buildLeaderboardInsights(DATA.leaderboard_scores);
+const PARITY_INSIGHTS = Array.isArray(DATA.parity_insights) ? DATA.parity_insights : [];
+const HISTORY_INSIGHTS = Array.isArray(DATA.history_insights) ? DATA.history_insights : [];
 
 // Each entry in inversion_analysis may have:
 //   match_type: "prefix" (bullet starts with match_key) or "contains" (bullet includes match_key)
@@ -1075,9 +1372,11 @@ const tabDefs = {{
       "reward_mean",
       "reward_std",
       "reasoning",
+      "trial_folder_path",
       "trajectory_json_path",
       "verifier_test_stdout_path",
       "verifier_reward",
+      "exception_type",
       "error_category",
       "matched_patterns"
     ],
@@ -1226,8 +1525,8 @@ function cellClass(key, value, row) {{
   }}
   if (key === "reward_std" && String(value || "") && rowIsStdOutlier(row)) return "mono std-outlier";
   if (key === "verifier_test_stdout_path") return "mono col-stdout-wide";
-  if (key === "trajectory_json_path" || key === "trajectory_last_step") return "mono";
-  if (key === "reward_mean" || key === "reward_std") return "mono";
+  if (key === "trial_folder_path" || key === "trajectory_json_path" || key === "trajectory_last_step") return "mono";
+  if (key === "exception_type" || key === "reward_mean" || key === "reward_std") return "mono";
   return "";
 }}
 
@@ -1241,6 +1540,22 @@ function escapeHtml(value) {{
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}}
+
+function linkifyEscapedText(escapedValue) {{
+  return String(escapedValue).replace(/https?:\/\/[^\s<]+/g, function(rawUrl) {{
+    let url = rawUrl;
+    let suffix = "";
+    while (/[).,;:]$/.test(url)) {{
+      suffix = url.slice(-1) + suffix;
+      url = url.slice(0, -1);
+    }}
+    return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>${suffix}`;
+  }});
+}}
+
+function renderRichText(value) {{
+  return linkifyEscapedText(escapeHtml(safeCell(value)));
 }}
 
 function safeCell(value) {{
@@ -1263,6 +1578,12 @@ function prettyLastStep(raw) {{
 
 function renderCell(key, value, row) {{
   var safeValue = safeCell(value);
+  if (key === "trial_folder_path" && safeValue) {{
+    return safeValue.split(" | ").map(function (path, idx) {{
+      if (path === "—") return '<span style="color:var(--muted)">trial folder' + (idx + 1) + '</span>';
+      return '<div class="tooltip-wrap"><a class="path-link" href="file://' + encodeURI(path) + '" title="' + escapeHtml(path) + '">trial folder' + (idx + 1) + '</a></div>';
+    }}).join("");
+  }}
   if (key === "trajectory_json_path" && safeValue) {{
     var lastSteps = safeCell(row.trajectory_last_step).split(" || ");
     return safeValue.split(" | ").map(function (path, idx) {{
@@ -1292,6 +1613,16 @@ function renderCell(key, value, row) {{
       if (!v || v === "—") return '<div style="color:var(--muted);font-family:ui-monospace,monospace;font-size:12px">—</div>';
       return '<div style="font-family:ui-monospace,monospace;font-size:12px">' + escapeHtml(v) + '</div>';
     }}).join("");
+  }}
+  if (key === "exception_type" && safeValue) {{
+    return safeValue.split(" | ").map(function (val) {{
+      const v = val.trim();
+      if (!v || v === "—") return '<div style="color:var(--muted);font-family:ui-monospace,monospace;font-size:12px">—</div>';
+      return '<div style="font-family:ui-monospace,monospace;font-size:12px">' + escapeHtml(v) + '</div>';
+    }}).join("");
+  }}
+  if (key === "reasoning" || key === "rerun_reason") {{
+    return renderRichText(safeValue);
   }}
   return escapeHtml(safeValue);
 }}
@@ -1557,18 +1888,20 @@ function renderAccuracyInsightSections() {
   const inversionSections = new Set([
     "Model Inversions (across this benchmark)",
     "Agent Inversions (across this benchmark)",
-    "Native Agent Underperformance",
     "Cross-Family Surprises",
     "Model Laggards (across leaderboard)",
     "Harness Laggards (across leaderboard)",
+    "Parity Comparison (adapter cross-reference)",
+    "Historical Trend Check (harbor-mix-analyzer)",
   ]);
   const sections = [
     ["Model Inversions (across this benchmark)", ACCURACY_INSIGHT_SUMMARY["Model Inversions"] || [], "Per (model, agent) mean across tasks from extracted trial data. Flags stronger models scoring >5pp below weaker family peers on the same agent."],
     ["Agent Inversions (across this benchmark)", ACCURACY_INSIGHT_SUMMARY["Agent Inversions"] || [], "Per (model, agent) mean across tasks from extracted trial data. Flags stronger agents scoring >5pp below weaker agents on the same model."],
-    ["Native Agent Underperformance", ACCURACY_INSIGHT_SUMMARY["Native Agent Underperformance"] || []],
-    ["Cross-Family Surprises", ACCURACY_INSIGHT_SUMMARY["Cross-Family Surprises"] || []],
     ["Model Laggards (across leaderboard)", LEADERBOARD_INSIGHTS["Model Laggards"] || [], "Per-model mean across all agents from get_leaderboard. Flags models whose cross-agent average inverts expected family ranking or is negative."],
     ["Harness Laggards (across leaderboard)", LEADERBOARD_INSIGHTS["Harness Laggards"] || [], "Per (model, agent) score from get_leaderboard. Flags agents ≥15pp below the same model’s best-agent score."],
+    ["Parity Comparison (adapter cross-reference)", PARITY_INSIGHTS, DATA.parity_insights_subtitle || "Cross-reference live leaderboard scores against Harbor adapter parity baselines."],
+    ["Historical Trend Check (harbor-mix-analyzer)", HISTORY_INSIGHTS, DATA.history_insights_subtitle || "Cross-reference live leaderboard scores against normalized historical trends from harbor-mix-analyzer."],
+    ["Cross-Family Surprises", ACCURACY_INSIGHT_SUMMARY["Cross-Family Surprises"] || []],
   ];
   panel.innerHTML = chartHtml + sections.map(function (entry) {
     const title = entry[0], subset = entry[1], subtitle = entry[2] || "";
@@ -1595,11 +1928,11 @@ function renderAccuracyInsightSections() {
           var noteRows = (entry.task_notes || []).map(function(n) {
             const taskCell = escapeHtml(n.task);
             const modelCell = n.model ? `<td>${escapeHtml(n.model)}</td>` : "";
-            return `<tr><td>${taskCell}</td>${modelCell}<td>${escapeHtml(n.note)}</td></tr>`;
+            return `<tr><td>${taskCell}</td>${modelCell}<td>${renderRichText(n.note)}</td></tr>`;
           }).join("");
           detail = `<details class="inversion-detail">`
             + `<summary>Root-cause analysis ▸</summary>`
-            + `<p>${escapeHtml(entry.root_cause)}</p>`
+            + `<p>${renderRichText(entry.root_cause)}</p>`
             + (noteRows ? `<table>${noteRows}</table>` : "")
             + `</details>`;
         });
@@ -1735,6 +2068,9 @@ def main() -> None:
     rerun_rows = read_optional_tsv(args.tables_dir / "rerun_summary.tsv")
     rerun_summary = read_optional_json(args.tables_dir / "rerun_summary.json")
     combined_rows = build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows, rerun_rows)
+    leaderboard_scores = read_leaderboard_scores(args.benchmark)
+    parity_insights, parity_subtitle = build_parity_insights(args.benchmark, leaderboard_scores)
+    history_insights, history_subtitle = build_history_insights(args.benchmark, leaderboard_scores)
 
     data = {
         "ok_rows": ok_rows,
@@ -1746,7 +2082,11 @@ def main() -> None:
         "rerun_summary": rerun_summary,
         "combined_rows": combined_rows,
         "summary": build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows),
-        "leaderboard_scores": read_leaderboard_scores(args.benchmark),
+        "leaderboard_scores": leaderboard_scores,
+        "parity_insights": parity_insights,
+        "parity_insights_subtitle": parity_subtitle,
+        "history_insights": history_insights,
+        "history_insights_subtitle": history_subtitle,
         "inversion_analysis": read_inversion_analysis(args.benchmark),
     }
 

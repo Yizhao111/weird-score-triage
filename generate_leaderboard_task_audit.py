@@ -1469,11 +1469,19 @@ def generate_step3_tables(benchmark):
                 "missing_verifier_test_stdout_txt": sum(
                     1 for trial in cell_trials if not trial["has_verifier_stdout"]
                 ),
+                "trial_folder_path": " | ".join(
+                    str(Path(trial["trajectory_path"]).parent.parent)
+                    for trial in cell_trials
+                    if trial["trajectory_path"]
+                ),
                 "trajectory_json_path": " | ".join(
                     trial["trajectory_path"] for trial in cell_trials if trial["trajectory_path"]
                 ),
                 "verifier_test_stdout_path": " | ".join(
                     trial["verifier_stdout_path"] for trial in cell_trials if trial["verifier_stdout_path"]
+                ),
+                "exception_type": " | ".join(
+                    trial["exception_type"] for trial in cell_trials if trial["exception_type"]
                 ),
                 "trajectory_last_step": " || ".join(last_steps),
             }
@@ -1594,6 +1602,9 @@ def render_step3_html(benchmark, html_path):
     rerun_rows = step3.read_optional_tsv(tables_dir / "rerun_summary.tsv")
     rerun_summary = step3.read_optional_json(tables_dir / "rerun_summary.json")
     combined_rows = step3.build_combined_rows(ok_rows, error_category_rows, missing_rows, reasoning_rows, rerun_rows)
+    leaderboard_scores = step3.read_leaderboard_scores(benchmark)
+    parity_insights, parity_subtitle = step3.build_parity_insights(benchmark, leaderboard_scores)
+    history_insights, history_subtitle = step3.build_history_insights(benchmark, leaderboard_scores)
     data = {
         "ok_rows": ok_rows,
         "error_category_rows": error_category_rows,
@@ -1604,7 +1615,11 @@ def render_step3_html(benchmark, html_path):
         "rerun_summary": rerun_summary,
         "combined_rows": combined_rows,
         "summary": step3.build_summary(ok_rows, error_category_rows, error_type_rows, missing_rows),
-        "leaderboard_scores": step3.read_leaderboard_scores(benchmark),
+        "leaderboard_scores": leaderboard_scores,
+        "parity_insights": parity_insights,
+        "parity_insights_subtitle": parity_subtitle,
+        "history_insights": history_insights,
+        "history_insights_subtitle": history_subtitle,
         "inversion_analysis": step3.read_inversion_analysis(benchmark),
     }
     html = step3.render_html(benchmark, data)

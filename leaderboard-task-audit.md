@@ -694,7 +694,9 @@ This Step 3-style HTML is the intended final deliverable for focused benchmark t
 
 The report now renders a single merged table with:
 - per-cell `task`, `agent`, `model`, `n_trials`, exception summary, `reward_mean`, and `reward_std`
+- a clickable `trial_folder_path` column linking to the extracted trial directory
 - clickable `trajectory_json_path` and `verifier_test_stdout_path`
+- an `exception_type` column showing `exception_info.exception_type` from `result.json`
 - merged `error_category` and `matched_patterns`
 - optional subagent-produced `reasoning`
 
@@ -714,13 +716,14 @@ The **Accuracy & Insight** tab contains:
 
 1. **Agent × Model Score chart** — horizontal grouped bar chart (models on Y axis sorted by best score desc, agents as bar series with pastel colours, score labels at bar ends, legend on the right). Data source: `get_leaderboard` scores read from `/tmp/leaderboard_aggregate.json`. The script's `read_leaderboard_scores(benchmark)` function filters this file for the current benchmark and passes the result as `DATA.leaderboard_scores`.
 
-2. **Six insight subsections** (2-column grid below the chart):
+2. **Seven insight subsections** (2-column grid below the chart):
    - **Model Inversions (across this benchmark)** — task-level extracted trial data; flags stronger models scoring >5pp below weaker family peers on the same agent.
    - **Agent Inversions (across this benchmark)** — task-level extracted trial data; flags stronger agents scoring >5pp below weaker agents on the same model.
-   - **Native Agent Underperformance** — task-level data; flags models scoring significantly lower on their native agent than on others.
-   - **Cross-Family Surprises** — task-level data; flags weaker models outperforming frontier models from other families.
    - **Model Laggards (across leaderboard)** — `get_leaderboard` data; computes per-model cross-agent mean and flags models whose mean inverts expected family ranking (>3pp gap) or is negative.
    - **Harness Laggards (across leaderboard)** — `get_leaderboard` data; flags (model, agent) pairs where the agent score is ≥15pp below the model's best-agent score.
+   - **Parity Comparison (adapter cross-reference)** — benchmark-level live means versus Harbor adapter parity baselines, shown only when comparable parity data exists.
+   - **Historical Trend Check (harbor-mix-analyzer)** — benchmark-level live means versus normalized historical results, shown only when comparable history exists.
+   - **Cross-Family Surprises** — task-level data; flags weaker models outperforming frontier models from other families.
 
 **Trajectory and stdout path cells** render as short labels (`trajectory.json1`, `trajectory.json2`, `test-stdout.txt1`, …). The full path is shown on native hover (title attribute) and the link opens the file directly. Hovering a `test-stdout.txt` label also shows a preview of the first 3 000 characters of that file in a tooltip panel.
 
@@ -730,13 +733,14 @@ If `/tmp/<benchmark>_inversion_analysis.json` exists, each non-empty subsection 
 
 ### Step 3e — Insight analysis with subagents
 
-After Step 3d, open the **Accuracy & Insight** tab and check all six subsections. For any section that contains flagged items, run subagents to examine the extracted trajectories and produce a root-cause explanation that the HTML will render inline under each bullet as a collapsible **"Root-cause analysis ▸"** block.
+After Step 3d, open the **Accuracy & Insight** tab and check all seven subsections. For any section that contains flagged items, run subagents to examine the extracted trajectories and produce a root-cause explanation that the HTML will render inline under each bullet as a collapsible **"Root-cause analysis ▸"** block. The root cause should include at least one concrete example link constructed in the format `https://harborsubabase.vercel.app/trial_view?benchmark=<benchmark_name>&task=<task_name>&model=<model_name>&agent=<agent_name>` (for example `https://harborsubabase.vercel.app/trial_view?benchmark=aime&task=aime_61&model=gpt-5-mini&agent=codex`). URL-encode each parameter value when constructing the link.
 
-This applies to all six sections:
+This applies to all seven sections:
 - **Model Inversions** and **Agent Inversions** — computed from `ok_runs.tsv` `reward_mean`
-- **Native Agent Underperformance** — same source
 - **Cross-Family Surprises** — same source
 - **Model Laggards** and **Harness Laggards** — computed from `get_leaderboard` aggregate scores
+- **Parity Comparison (adapter cross-reference)** — computed from live leaderboard model means versus comparable Harbor adapter parity baselines
+- **Historical Trend Check (harbor-mix-analyzer)** — computed from live leaderboard model means versus normalized `results_over_time` history
 
 **When to run this step**
 - Any bullet appears in any Accuracy & Insight subsection.
@@ -876,6 +880,8 @@ The subagent should:
 2. Read `agent/trajectory.json` (or `agent/<agent>.txt`) — compare step count, answer mechanism, output format
 3. Read `result.json` and `verifier/test-stdout.txt` for reward confirmation
 4. Identify the consistent behavioural difference that explains the finding
+5. Include at least one concrete `trial_view` URL in the `root_cause` text or in one of the `task_notes`, using URL-encoded `benchmark`, `task`, `model`, and `agent` values
+6. For parity/history bullets, focus subagent analysis on non-expected outcomes only (for example `REGRESSION`, `INFLATION`, or parity mismatches outside the expected band). Use the parity or historical delta as context, but ground the explanation in the extracted current-run trajectories and verifier outputs.
 
 **Output contract**
 
@@ -891,7 +897,7 @@ Each subagent returns a JSON object. Merge all into `/tmp/<benchmark>_inversion_
     "weaker_model": "<model>",
     "weaker_score": 0.236,
     "gap": 0.056,
-    "root_cause": "<2-3 sentence explanation>",
+    "root_cause": "<2-3 sentence explanation with at least one example trial_view URL>",
     "task_notes": [
       {"task": "<task>", "note": "<1-2 sentence comparison>"},
       ...
@@ -905,7 +911,7 @@ Each subagent returns a JSON object. Merge all into `/tmp/<benchmark>_inversion_
     "primary_model": "<model>",
     "agent": "<agent>",
     "score": 0.000,
-    "root_cause": "<2-3 sentence explanation>",
+    "root_cause": "<2-3 sentence explanation with at least one example trial_view URL>",
     "task_notes": [...]
   },
   {
@@ -915,7 +921,25 @@ Each subagent returns a JSON object. Merge all into `/tmp/<benchmark>_inversion_
     "match_key": "<frontier_model> best=",
     "primary_model": "<frontier_model_underperforming>",
     "agent": "<agent>",
-    "root_cause": "<2-3 sentence explanation>",
+    "root_cause": "<2-3 sentence explanation with at least one example trial_view URL>",
+    "task_notes": [...]
+  },
+  {
+    "type": "history_regression",
+    "section": "Historical Trend Check (harbor-mix-analyzer)",
+    "match_type": "prefix",
+    "match_key": "REGRESSION: <model> ",
+    "primary_model": "<model>",
+    "root_cause": "<2-3 sentence explanation with at least one example trial_view URL>",
+    "task_notes": [...]
+  },
+  {
+    "type": "parity_regression",
+    "section": "Parity Comparison (adapter cross-reference)",
+    "match_type": "prefix",
+    "match_key": "REGRESSION: <model> ",
+    "primary_model": "<model>",
+    "root_cause": "<2-3 sentence explanation with at least one example trial_view URL>",
     "task_notes": [...]
   }
 ]
@@ -933,6 +957,8 @@ The HTML matches each entry to the correct insight bullet using these fields. Th
 | Harness Laggards | `model/agent (0.0) is 77.8pp below model/best (77.8).` | `prefix` | `claude-opus-4-6/terminus-2 (` |
 | Model Laggards | `model avg 45.2 is 12.3pp below model avg 57.5 — …` | `prefix` | `claude-opus-4-6 avg ` |
 | Native Underperf. | `model/native=0.300 is below model/other=0.500.` | `prefix` | `claude-opus-4-6/claude-code=` |
+| Parity Comparison | `REGRESSION: model live avg=...` or `NEEDS_INVESTIGATION: model live avg=...` | `prefix` | `REGRESSION: claude-haiku-4-5-20251001 ` |
+| Historical Trend Check | `REGRESSION: model live avg=...` or `INFLATION: model live avg=...` | `prefix` | `INFLATION: gemini-3-flash-preview ` |
 
 For **Model/Agent Inversion** entries without explicit `match_type`/`match_key`, the HTML defaults to prefix matching on `stronger_model/agent=` (or `model/stronger_agent=`).
 
